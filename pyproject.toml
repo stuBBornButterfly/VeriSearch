@@ -1,0 +1,152 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "verisearch"
+version = "0.1.0"
+description = "RL-trained retrieval reasoner with a faithfulness reward."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Ayesha Siddika" },
+    { name = "Tahsinul Haque Dhrubo" },
+]
+
+# Core deps only. Must stay CPU-installable and fast: the Jenkins
+# lint/typecheck/unit/integration stages install exactly this plus [dev].
+dependencies = [
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.2,<3",
+    "pyyaml>=6.0,<7",
+    "numpy>=1.26,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "types-PyYAML>=6.0",
+]
+
+# Ayesha's half. Installed on the machine that builds the index.
+retrieval = [
+    "faiss-cpu>=1.8",
+    "sentence-transformers>=3.0",
+    "transformers>=4.43",
+    "torch>=2.3",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+]
+
+# Dhrubo's half. GPU box only. Never installed in the PR pipeline.
+train = [
+    "torch>=2.3",
+    "transformers>=4.43",
+    "peft>=0.11",
+    "accelerate>=0.31",
+    "vllm>=0.5",
+    "datasets>=2.20",
+    "wandb>=0.17",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["verisearch"]
+
+# ---------------------------------------------------------------------------
+# mypy - PROJECT.md section 3. Do not relax without both owners approving.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+disallow_any_explicit = true
+disallow_any_generics = true
+plugins = ["pydantic.mypy"]
+files = ["verisearch"]
+
+[[tool.mypy.overrides]]
+module = ["faiss.*", "vllm.*", "peft.*", "sentence_transformers.*"]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["verisearch", "tests", "scripts"]
+# Do not reformat Python snippets inside Markdown - PROJECT.md is the brief,
+# not source, and its code blocks are illustrative.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "N",             # pep8-naming
+    "UP",            # pyupgrade
+    "B",             # bugbear
+    "C4",            # comprehensions
+    "SIM",           # simplify
+    "PT",            # pytest style
+    "RET",           # return
+    "ARG",           # unused arguments
+    "PTH",           # use pathlib
+    "TID",           # tidy imports
+    "RUF",
+]
+ignore = [
+    "E501",  # line length is enforced by the formatter
+]
+
+# PROJECT.md section 3: "from __future__ import annotations in every module".
+# Enforced here so CI catches it instead of a reviewer.
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
+known-first-party = ["verisearch"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG"]        # fixtures are legitimately unused args
+"scripts/*" = ["T201"]     # scripts print
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "gpu: requires a CUDA device (excluded from the PR pipeline)",
+    "integration: end-to-end, fake retriever, CPU only, under 60s",
+    "slow: excluded from the PR pipeline",
+]
+
+# ---------------------------------------------------------------------------
+# coverage
+# Floor is 80%. PROJECT.md scopes it to rewards/, env/, eval/metrics/ - those
+# packages do not exist until P2, so the gate measures the whole package for
+# now. Tighten the `source` list at P2 exit.
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["verisearch"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]

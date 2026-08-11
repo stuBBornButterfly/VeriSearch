@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Project artifacts (large, regenerated, never committed)
+data/raw/
+data/processed/
+indexes/
+checkpoints/
+outputs/
+wandb/
+results/raw/*
+!results/raw/.gitkeep
+results/figures/*
+!results/figures/.gitkeep
+
+# Model weights
+*.bin
+*.safetensors
+*.pt
+*.faiss
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,69 @@
+# Base config. Owner: Ayesha. Loaded by verisearch/config.py (P1).
+# "Config as data" - no magic numbers in code (PROJECT.md section 3).
+# Values here come from PROJECT.md sections 5 and 6. Changing one is a PR.
+
+seed: 42
+
+model:
+  # Dev policy. All debugging happens here.
+  policy: Qwen2.5-1.5B-Instruct
+  policy_repo: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: bfloat16
+  load_in_4bit: false
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+retrieval:
+  embedder: BAAI/bge-small-en-v1.5
+  embedding_dim: 384
+  index_type: hnsw
+  top_k: 3
+  service_url: http://127.0.0.1:8000
+
+faithfulness:
+  # Exact checkpoint not fixed yet - decide at P2, then pin here.
+  nli_model: MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli
+  entailment_threshold: 0.5
+
+env:
+  search_budget: 4
+  max_turns: 6
+  max_new_tokens: 512
+  stop_sequences:
+    - "</search>"
+    - "</answer>"
+
+reward:
+  w_correctness: 1.0
+  w_faithfulness: 0.5
+  w_format: 0.2
+  lambda_retrieval_cost: 0.05
+  penalties:
+    duplicate_query: -0.1
+    no_answer: -0.5
+    empty_query: -0.05
+
+train:
+  group_size: 8
+  kl_beta: 0.04
+  learning_rate: 1.0e-6
+  max_steps: 1000
+
+eval:
+  bootstrap_resamples: 1000
+  confidence_level: 0.95
+
+logging:
+  wandb_project: verisearch
+  wandb_entity: null

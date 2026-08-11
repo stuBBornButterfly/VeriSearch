@@ -1,0 +1,13 @@
+# Normalize line endings. Two machines, one repo - without this every file
+# churns between LF and CRLF and diffs become unreadable.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+*.faiss binary
+*.safetensors binary
+*.bin binary
+*.pt binary
+
+uv.lock linguist-generated=true
