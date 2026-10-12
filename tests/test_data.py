@@ -27,6 +27,7 @@ from verisearch.data.datasets import (
     load_jsonl,
     normalize_question,
     row_to_example,
+    spec_for,
     write_jsonl,
 )
 from verisearch.data.splits import (
@@ -520,3 +521,103 @@ def test_subsample_returns_everything_when_the_limit_exceeds_the_split() -> None
 def test_subsample_rejects_a_negative_limit() -> None:
     with pytest.raises(DataError, match="non-negative"):
         subsample([], Split.TRAIN, limit=-1, seed=42)
+
+
+def test_supporting_facts_as_a_flat_list_of_titles() -> None:
+    """A third shape, seen on mirrors that drop the sentence index.
+
+    Not hypothetical: some redistributions of HotpotQA flatten supporting_facts
+    to bare titles. The branch that handles it existed but was never exercised -
+    the coverage exclusion was dropping this whole function from measurement.
+    """
+    row = {
+        "id": "flat-1",
+        "question": "Who?",
+        "answer": "A",
+        "supporting_facts": ["Gallipoli (1981 film)", "Peter Weir"],
+    }
+    example = row_to_example(row, DATASET_SPECS["hotpotqa"])
+    assert example.supporting_titles == ("Gallipoli (1981 film)", "Peter Weir")
+
+
+def test_supporting_facts_list_skips_items_it_cannot_read() -> None:
+    """Empty pairs, numbers and non-string heads are dropped, not fatal.
+
+    A row that carries one unreadable supporting fact among several good ones is
+    still a usable example; refusing it would throw away training data over a
+    field only the retrieval metrics read.
+    """
+    row = {
+        "id": "mixed-1",
+        "question": "Who?",
+        "answer": "A",
+        "supporting_facts": [[], 7, [0, "wrong order"], ["Peter Weir", 2], "Gallipoli"],
+    }
+    example = row_to_example(row, DATASET_SPECS["hotpotqa"])
+    assert example.supporting_titles == ("Peter Weir", "Gallipoli")
+
+
+def test_supporting_facts_mapping_with_a_non_sequence_title_is_rejected() -> None:
+    """`{"title": "A"}` instead of `{"title": ["A"]}`.
+
+    Silently reading the string as a sequence of characters would produce 24
+    one-letter titles and a precision@k of zero that looks like a model problem.
+    """
+    row = {
+        "id": "badmap-1",
+        "question": "Who?",
+        "answer": "A",
+        "supporting_facts": {"title": "Peter Weir", "sent_id": [0]},
+    }
+    with pytest.raises(DataError, match=r"'supporting_facts'\['title'\] is not a sequence"):
+        row_to_example(row, DATASET_SPECS["hotpotqa"])
+
+
+def test_supporting_titles_are_deduplicated_in_first_seen_order() -> None:
+    """One title per supporting *sentence* in the raw data; we want paragraphs."""
+    row = {
+        "id": "dupes-1",
+        "question": "Who?",
+        "answer": "A",
+        "supporting_facts": {
+            "title": ["Peter Weir", "Gallipoli", "Peter Weir"],
+            "sent_id": [0, 1, 2],
+        },
+    }
+    example = row_to_example(row, DATASET_SPECS["hotpotqa"])
+    assert example.supporting_titles == ("Peter Weir", "Gallipoli")
+
+
+def test_answer_aliases_as_a_bare_string() -> None:
+    """Musique ships a list, but a single alias appears unwrapped on some rows."""
+    row = {"id": "a1", "question": "Who?", "answer": "Henry Ford", "answer_aliases": "Ford"}
+    example = row_to_example(row, DATASET_SPECS["musique"])
+    assert example.answers == ("Henry Ford", "Ford")
+
+
+def test_answer_aliases_of_the_wrong_type_is_rejected() -> None:
+    row = {"id": "a2", "question": "Who?", "answer": "Henry Ford", "answer_aliases": 7}
+    with pytest.raises(DataError, match="expected a string or sequence at 'answer_aliases'"):
+        row_to_example(row, DATASET_SPECS["musique"])
+
+
+def test_empty_and_non_string_aliases_are_dropped() -> None:
+    row = {
+        "id": "a3",
+        "question": "Who?",
+        "answer": "Henry Ford",
+        "answer_aliases": ["", "Ford", 7, None],
+    }
+    example = row_to_example(row, DATASET_SPECS["musique"])
+    assert example.answers == ("Henry Ford", "Ford")
+
+
+def test_spec_for_returns_the_named_spec() -> None:
+    assert spec_for("hotpotqa").hf_name == "distractor"
+
+
+@pytest.mark.parametrize("name", ["squad", "", "HotpotQA"])
+def test_spec_for_rejects_unknown_names_and_lists_the_known_ones(name: str) -> None:
+    """Case-sensitive on purpose: the keys are identifiers, not user input."""
+    with pytest.raises(DataError, match=r"Known: 2wikimultihopqa, bamboogle"):
+        spec_for(name)

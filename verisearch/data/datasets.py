@@ -277,7 +277,21 @@ def row_to_example(row: Mapping[str, object], spec: DatasetSpec) -> QAExample:
     )
 
 
-def load_hf_dataset(
+def spec_for(dataset: str) -> DatasetSpec:
+    """Look up a dataset spec by name, or raise listing the known names.
+
+    Split out of `load_hf_dataset` so the argument check is reachable in CI. The
+    download itself is not, and a function that can never run is a function
+    whose validation is never tested.
+    """
+    spec = DATASET_SPECS.get(dataset)
+    if spec is None:
+        known = ", ".join(sorted(DATASET_SPECS))
+        raise DataError(f"unknown dataset {dataset!r}. Known: {known}")
+    return spec
+
+
+def load_hf_dataset(  # pragma: no cover - needs the network and the [train] extra
     dataset: str, hf_split: str = "train", limit: int | None = None
 ) -> tuple[QAExample, ...]:
     """Download one dataset from Hugging Face and map it to examples.
@@ -285,12 +299,12 @@ def load_hf_dataset(
     Not exercised in CI - it needs the network and the `[train]` extra. Use it
     once to produce a JSONL snapshot, commit the snapshot, and read that
     everywhere else.
-    """
-    spec = DATASET_SPECS.get(dataset)
-    if spec is None:
-        known = ", ".join(sorted(DATASET_SPECS))
-        raise DataError(f"unknown dataset {dataset!r}. Known: {known}")
 
+    Excluded from coverage as a whole rather than line by line: every statement
+    past the spec lookup requires a download, and scattering pragmas through the
+    body makes the report harder to read than saying so once.
+    """
+    spec = spec_for(dataset)
     try:
         from datasets import load_dataset
     except ImportError as exc:  # pragma: no cover - requires the [train] extra
@@ -300,7 +314,7 @@ def load_hf_dataset(
 
     loaded = load_dataset(spec.hf_path, spec.hf_name, split=hf_split)
     examples: list[QAExample] = []
-    for index, row in enumerate(loaded):  # pragma: no cover - network
+    for index, row in enumerate(loaded):
         if limit is not None and index >= limit:
             break
         if not isinstance(row, Mapping):
