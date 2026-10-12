@@ -69,7 +69,8 @@ plugins = ["pydantic.mypy"]
 files = ["verisearch"]
 
 [[tool.mypy.overrides]]
-module = ["faiss.*", "vllm.*", "peft.*", "sentence_transformers.*"]
+# `datasets` is in the [train] extra, not core - the PR pipeline never installs it.
+module = ["faiss.*", "vllm.*", "peft.*", "sentence_transformers.*", "datasets.*"]
 ignore_missing_imports = true
 
 [tool.pydantic-mypy]
