@@ -21,6 +21,7 @@ import pytest
 
 from verisearch.retrieval.client import (
     CachingRetriever,
+    HttpRetriever,
     InMemoryDocStore,
     LocalRetriever,
     RetrievalError,
@@ -421,16 +422,25 @@ def test_a_zero_size_cache_is_refused() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_both_retrievers_satisfy_the_shared_protocol() -> None:
+def test_all_three_retrievers_satisfy_the_shared_protocol() -> None:
     """The assertion that matters is the return annotation inside
     `conformance_witnesses`, which mypy checks. `tests/` is outside mypy's
     `files` list, so asserting it here instead would never fail. This call is
-    what keeps that function from being dead code."""
+    what keeps that function from being dead code.
+
+    The HTTP one is included because three implementations of one protocol are
+    only useful if the caller cannot tell them apart - and that one is the only
+    implementation Dhrubo will actually point at a GPU box."""
     retriever, _ = make_retriever()
-    local, caching = conformance_witnesses(retriever, CachingRetriever(retriever))
+    local, caching, http = conformance_witnesses(
+        retriever, CachingRetriever(retriever), HttpRetriever("http://localhost:8099")
+    )
 
     assert local.search("analytical engine", 1)[0].doc_id == "d2"
     assert caching.search("analytical engine", 1)[0].doc_id == "d2"
+    # The HTTP witness is never called - there is no service here. Its reason
+    # for existing is the annotation; `tests/test_service.py` exercises it.
+    assert http.search("", 1) == []
 
 
 def test_an_index_hit_carries_no_text_so_the_join_is_the_only_source() -> None:
