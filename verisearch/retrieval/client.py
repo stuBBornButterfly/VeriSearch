@@ -17,21 +17,34 @@ structural protocol over `doc_id`/`title`/`text`, which `CorpusDoc` already
 satisfies, so `InMemoryDocStore.from_records(load_corpus(path))` type-checks with
 no dependency between the two packages.
 
-`HttpRetriever` is not here. It and `retrieval/service.py` share a wire schema
-and are only reviewable as one change.
+`HttpRetriever` is the other end of `retrieval/service.py`. It imports that
+module's response models rather than redeclaring them, so there is one definition
+of the wire format and mypy checks both ends against it. It uses stdlib `urllib`
+and no HTTP library: a client that needs nothing from the `[retrieval]` extra is
+a client the GPU box can run without installing faiss or torch.
 
 Owner: Ayesha.
 """
 
 from __future__ import annotations
 
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
-from verisearch.retrieval.index import IndexHit, VectorIndex, check_compatible
+from verisearch.retrieval.index import IndexHit, IndexMeta, VectorIndex, check_compatible
+from verisearch.retrieval.service import (
+    SERVICE_PROTOCOL_VERSION,
+    BatchSearchRequest,
+    BatchSearchResponse,
+    HealthResponse,
+    SearchRequest,
+    SearchResponse,
+)
 from verisearch.types import Passage
 
 if TYPE_CHECKING:
@@ -47,6 +60,20 @@ _FROZEN = ConfigDict(frozen=True, extra="forbid")
 # Cache size for `CachingRetriever`. 2048 (query, k) pairs is a few megabytes of
 # passage text and covers far more than one GRPO group's worth of queries.
 DEFAULT_CACHE_ENTRIES = 2048
+
+# Socket timeout for `HttpRetriever`, in seconds. Retrieval is a vector search
+# over a few tens of thousands of documents; if it has not answered in ten
+# seconds the service is wedged, not slow.
+DEFAULT_TIMEOUT_SECONDS = 10.0
+
+# Retries per request. One, not three: the failures this sees are a restarted
+# service or a dropped socket, both of which either clear immediately or do not
+# clear at all. More attempts just make a dead service take longer to notice.
+DEFAULT_RETRIES = 1
+
+# Any of the service's response models. Lets `_fetch` and `_validate` be written
+# once instead of per endpoint, without an explicit `Any` (banned by section 3).
+_ResponseT = TypeVar("_ResponseT", bound=BaseModel)
 
 
 class RetrievalError(ValueError):
@@ -195,6 +222,20 @@ class LocalRetriever:
         self._embedder = embedder
         self._docs = docs
 
+    @property
+    def meta(self) -> IndexMeta:
+        """The index's metadata. What `service.handle_health` reports.
+
+        Public because serving `/health` needs it, and the alternative was the
+        service reaching into `_index` - which would make the index an implicit
+        part of this class's interface without saying so.
+        """
+        return self._index.meta
+
+    @property
+    def n_docs(self) -> int:
+        return len(self._docs)
+
     def search(self, query: str, k: int) -> list[Passage]:
         """One query. The protocol method; everything else is a convenience."""
         return self.search_batch([query], k)[0]
@@ -302,10 +343,202 @@ class CachingRetriever:
         return passages
 
 
+class Transport(Protocol):
+    """One HTTP round trip. A seam, so the client is testable without a server.
+
+    Everything interesting about `HttpRetriever` - retries, status handling,
+    response validation, the parity rules it shares with the fake - is logic
+    above this line. Keeping the socket behind a protocol means all of it is
+    unit-testable, and the real transport still gets exercised end to end
+    against `http.server` from the standard library.
+    """
+
+    def request(self, url: str, payload: bytes | None, timeout: float) -> bytes: ...
+
+
+class UrllibTransport:
+    """stdlib `urllib`. No HTTP library, deliberately.
+
+    `httpx` and `requests` are both perfectly good and neither is a core
+    dependency. Adding one would mean the GPU box has to install something to
+    talk to retrieval, and the whole point of putting the index behind a service
+    is that the training host needs nothing from the `[retrieval]` extra.
+    """
+
+    def request(self, url: str, payload: bytes | None, timeout: float) -> bytes:
+        if not url.startswith(("http://", "https://")):
+            # urllib will happily open file:// or ftp:// from a base_url typo,
+            # which would read a local file and try to parse it as a response.
+            raise RetrievalError(f"refusing a non-HTTP retrieval URL: {url!r}")
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        # urllib defaults to GET without data and POST with it, which is what
+        # the service expects. Left to that default rather than forced, but
+        # stated here because it is not obvious from the call.
+        request = urllib.request.Request(url, data=payload, headers=headers)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw: bytes = response.read()
+        return raw
+
+
+class HttpRetriever:
+    """Talks to `retrieval/service.py`. Implements `types.Retriever`.
+
+    Request validation happens client-side, before the socket, using the same
+    rules as `LocalRetriever` and `FakeRetriever`: a blank query returns no
+    passages without a round trip, and a non-positive `k` raises. Three
+    implementations of one protocol are only useful if they are
+    indistinguishable to the caller.
+
+    **A failed search raises. It never returns an empty list.** Inside a
+    training run, `[]` from a broken service is indistinguishable from "nothing
+    matched", and across thousands of steps the policy would learn that
+    searching does not pay - which is precisely the degenerate collapse the
+    lambda term is supposed to be the only pressure toward. A crashed run is
+    recoverable. A run that silently trained against a dead retriever is not.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        transport: Transport | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        retries: int = DEFAULT_RETRIES,
+    ) -> None:
+        if retries < 0:
+            raise RetrievalError(f"retries must be >= 0, got {retries}")
+        if timeout <= 0:
+            raise RetrievalError(f"timeout must be positive, got {timeout}")
+        self._base_url = base_url.rstrip("/")
+        self._transport: Transport = transport if transport is not None else UrllibTransport()
+        self._timeout = timeout
+        self._retries = retries
+
+    @classmethod
+    def connect(
+        cls,
+        base_url: str,
+        *,
+        expect_fingerprint: str | None = None,
+        transport: Transport | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        retries: int = DEFAULT_RETRIES,
+    ) -> HttpRetriever:
+        """Build a client and check the service before handing it back.
+
+        Separate from `__init__` so that constructing an object never does I/O,
+        but this is the path to use. It is the wire-crossing version of
+        `index.check_compatible`, and the mismatch it catches - a caller whose
+        corpus was built by a different embedder than the service is serving -
+        produces plausible passages for an entire run and raises nothing.
+        """
+        client = cls(base_url, transport=transport, timeout=timeout, retries=retries)
+        health = client.health()
+        if health.protocol_version != SERVICE_PROTOCOL_VERSION:
+            raise RetrievalError(
+                f"service speaks protocol {health.protocol_version}, this client speaks "
+                f"{SERVICE_PROTOCOL_VERSION}. Upgrade one of them rather than hoping the "
+                f"wire format did not change."
+            )
+        if expect_fingerprint is not None and health.embedder_fingerprint != expect_fingerprint:
+            raise RetrievalError(
+                f"service is serving an index built with embedder fingerprint "
+                f"{health.embedder_fingerprint} ({health.embedder_model}), caller expected "
+                f"{expect_fingerprint}. Querying across a mismatch returns plausible "
+                f"nonsense silently."
+            )
+        return client
+
+    def health(self) -> HealthResponse:
+        return self._validate(HealthResponse, self._fetch("/health", None), "/health")
+
+    def search(self, query: str, k: int) -> list[Passage]:
+        if k <= 0:
+            raise RetrievalError(f"k must be positive, got {k}")
+        if not query.strip():
+            return []
+        payload = SearchRequest(query=query, k=k).model_dump_json().encode("utf-8")
+        response = self._validate(SearchResponse, self._fetch("/search", payload), "/search")
+        self._check_echo(response.query, query, response.k, k)
+        return list(response.passages)
+
+    def search_batch(self, queries: Sequence[str], k: int) -> list[list[Passage]]:
+        """Several queries in one round trip. See `LocalRetriever.search_batch`."""
+        if k <= 0:
+            raise RetrievalError(f"k must be positive, got {k}")
+        if not queries:
+            raise RetrievalError("search_batch needs at least one query")
+
+        real = [(position, q) for position, q in enumerate(queries) if q.strip()]
+        results: list[list[Passage]] = [[] for _ in queries]
+        if not real:
+            return results
+
+        request = BatchSearchRequest(queries=tuple(q for _, q in real), k=k)
+        raw = self._fetch("/search_batch", request.model_dump_json().encode("utf-8"))
+        response = self._validate(BatchSearchResponse, raw, "/search_batch")
+
+        if len(response.results) != len(real):
+            raise RetrievalError(
+                f"/search_batch returned {len(response.results)} results for {len(real)} "
+                f"queries. Results are positional, so a length mismatch means some rollout "
+                f"would be scored against another rollout's passages."
+            )
+        for (position, query), result in zip(real, response.results, strict=True):
+            self._check_echo(result.query, query, result.k, k)
+            results[position] = list(result.passages)
+        return results
+
+    def _check_echo(self, got_query: str, want_query: str, got_k: int, want_k: int) -> None:
+        """Verify the response is answering the question that was asked.
+
+        The service echoes `query` and `k` precisely so this check can exist. A
+        proxy, a retry or a batch misalignment that swaps two responses is
+        otherwise undetectable: the passages are well-formed, they are simply
+        about something else, and every reward still produces a number.
+        """
+        if got_query != want_query or got_k != want_k:
+            raise RetrievalError(
+                f"service answered query {got_query!r} at k={got_k} but was asked "
+                f"{want_query!r} at k={want_k}. Responses are being mismatched to "
+                f"requests, so passages would be scored against the wrong question."
+            )
+
+    def _fetch(self, path: str, payload: bytes | None) -> bytes:
+        url = f"{self._base_url}{path}"
+        last: Exception | None = None
+        for _ in range(self._retries + 1):
+            try:
+                return self._transport.request(url, payload, self._timeout)
+            except urllib.error.HTTPError as exc:
+                # A 4xx is this client's own fault and fails identically on a
+                # retry, so it is not retried. Read the body: the service puts
+                # the actual reason in `detail`.
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+                raise RetrievalError(f"{url} returned HTTP {exc.code}: {detail}") from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last = exc
+        raise RetrievalError(
+            f"{url} failed after {self._retries + 1} attempt(s): {last}. Not returning an "
+            f"empty result - a training run cannot tell that apart from 'nothing matched'."
+        ) from last
+
+    def _validate(self, model: type[_ResponseT], raw: bytes, path: str) -> _ResponseT:
+        try:
+            return model.model_validate_json(raw)
+        except ValueError as exc:
+            raise RetrievalError(
+                f"{self._base_url}{path} returned something that is not a {model.__name__}: {exc}"
+            ) from exc
+
+
 def conformance_witnesses(
     local: LocalRetriever,
     caching: CachingRetriever,
-) -> tuple[Retriever, Retriever]:
+    http: HttpRetriever,
+) -> tuple[Retriever, Retriever, Retriever]:
     """Return both retrievers typed as `types.Retriever`, so mypy checks the fit.
 
     The same mechanism `verisearch/testing/fakes.py` uses, for the same reason:
@@ -314,4 +547,4 @@ def conformance_witnesses(
     annotation is what notices if a signature drifts from the protocol - and the
     test that calls it is what keeps this function from being dead code.
     """
-    return local, caching
+    return local, caching, http
