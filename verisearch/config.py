@@ -466,6 +466,20 @@ def load_sweep(path: str | Path) -> SweepSpec:
         raise ConfigError(f"invalid sweep manifest {target}:\n{exc}") from exc
 
 
+def sweep_run_name(sweep_name: str, lambda_value: float) -> str:
+    """The run name for one sweep point. One definition, two callers.
+
+    `:g` so 0.0 reads as "0" and 0.02 as "0.02" - these names become W&B run
+    names and result directory names, and "lam0.000000" is unreadable.
+
+    Extracted from `sweep_points` because `eval/frontier.py` has to find a
+    sweep's results on disk by name. Two copies of this format string would
+    diverge, and the symptom would be a frontier plot silently missing a point
+    while reporting that it read everything the manifest asked for.
+    """
+    return f"{sweep_name}-lam{lambda_value:g}"
+
+
 def sweep_points(spec: SweepSpec, *, root: str | Path | None = None) -> tuple[SweepPoint, ...]:
     """Expand a manifest into one ready-to-run config per lambda.
 
@@ -482,9 +496,7 @@ def sweep_points(spec: SweepSpec, *, root: str | Path | None = None) -> tuple[Sw
     return tuple(
         SweepPoint(
             lambda_value=value,
-            # `:g` so 0.0 reads as "0" and 0.02 as "0.02" - these names become
-            # W&B run names and directory names, and "lam0.000000" is unreadable.
-            run_name=f"{spec.name}-lam{value:g}",
+            run_name=sweep_run_name(spec.name, value),
             config=shared.with_lambda(value),
         )
         for value in spec.lambdas
