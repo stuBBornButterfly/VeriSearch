@@ -68,9 +68,19 @@ disallow_any_generics = true
 plugins = ["pydantic.mypy"]
 files = ["verisearch"]
 
+# Everything in the [retrieval] or [train] extra. None of it is installed in the
+# PR pipeline, so mypy cannot see stubs for any of it; each import site is
+# deferred and guarded. Adding a name here is not a relaxation of strict - it
+# says "this package is not installed", not "do not check this code".
 [[tool.mypy.overrides]]
-# `datasets` is in the [train] extra, not core - the PR pipeline never installs it.
-module = ["faiss.*", "vllm.*", "peft.*", "sentence_transformers.*", "datasets.*"]
+module = [
+    "datasets.*",
+    "faiss.*",
+    "fastapi.*",
+    "peft.*",
+    "sentence_transformers.*",
+    "vllm.*",
+]
 ignore_missing_imports = true
 
 [tool.pydantic-mypy]
