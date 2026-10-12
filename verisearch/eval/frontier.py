@@ -380,7 +380,11 @@ def load_sweep_results(
         run_name = sweep_run_name(spec.name, value)
         path = output_dir / run_name / REPORT_FILENAME
         if not path.is_file():
-            missing.append(f"λ={value:g} ({path})")
+            # ASCII in the message: this reaches stderr, and a Windows
+            # console at cp1252 renders a lambda glyph as a literal
+            # "\u03bb". The table keeps the symbol - it is written to a
+            # UTF-8 file for the writeup.
+            missing.append(f"lambda={value:g} ({path})")
             continue
         try:
             report = EvalReport.model_validate_json(path.read_text(encoding="utf-8"))
