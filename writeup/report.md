@@ -282,7 +282,12 @@ budget will not stretch to four 3B runs, cut from the middle and keep 0 and 0.1.
 
 {{frontier-table}}
 
-![Accuracy versus retrieval-count frontier]({{figure-path}})
+![Accuracy versus retrieval-count frontier](../results/figures/frontier.png)
+
+The path is the default `scripts/04_sweep.sh` writes to, so the image resolves
+the moment the sweep runs and shows as broken until then. That is the intended
+state - a placeholder here would have to be remembered, and a broken image
+cannot be overlooked.
 
 Accuracy on the figure is **F1, not EM** — EM on multi-hop answers is a coarse,
 noisy axis, and a frontier drawn on it moves in steps. Every point in the sweep
