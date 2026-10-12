@@ -387,3 +387,105 @@ def load_config(*paths: str | Path) -> Config:
         # per-field detail while giving callers one type to catch.
         joined = ", ".join(str(p) for p in targets)
         raise ConfigError(f"invalid config from [{joined}]:\n{exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Lambda sweep. PROJECT.md section 6 and the P4 exit criterion.
+# ---------------------------------------------------------------------------
+
+
+class SweepPoint(BaseModel):
+    """One run of the sweep: a lambda, a run name, and the config to run."""
+
+    model_config = _SECTION
+
+    lambda_value: float = Field(ge=0.0)
+    run_name: str = Field(min_length=1)
+    config: Config
+
+
+class SweepSpec(BaseModel):
+    """The lambda sweep, as data.
+
+    This is not a `Config` overlay and must not be loaded as one. A single
+    config holds one lambda; the sweep is N runs that differ in exactly that
+    number, so the manifest lists the lambdas and the base files they share.
+
+    Typed rather than left as an array in `scripts/04_sweep.sh` because the
+    failure it prevents is expensive: a sweep launched with a duplicated or
+    missing lambda produces a frontier plot with a point missing or two points
+    on top of each other, and you find out after the GPU hours are spent.
+    """
+
+    model_config = _SECTION
+
+    name: str = Field(min_length=1)
+    # Composed left to right by `load_config`, so later files win.
+    base: tuple[Path, ...] = Field(min_length=1)
+    lambdas: tuple[float, ...] = Field(min_length=2)
+    output_dir: Path
+
+    @model_validator(mode="after")
+    def _check_lambdas(self) -> Self:
+        negative = [value for value in self.lambdas if value < 0.0]
+        if negative:
+            # `Field(min_length=2)` constrains the tuple, not its elements, so
+            # without this a negative lambda loads cleanly here and only fails
+            # later inside `with_lambda` - after the manifest has been reviewed
+            # and the sweep launched.
+            raise ValueError(
+                f"lambdas must be non-negative, got {negative}; a negative retrieval cost "
+                f"pays the policy to search, which is the opposite of the experiment"
+            )
+        if len(set(self.lambdas)) != len(self.lambdas):
+            raise ValueError(
+                f"lambdas must be distinct, got {list(self.lambdas)}; a repeated value "
+                f"spends a training run producing a point that is already on the plot"
+            )
+        if 0.0 not in self.lambdas:
+            # The frontier shows accuracy traded against retrieval count. Every
+            # other point is read relative to the un-penalised run, so without
+            # it the plot has no anchor and the trade-off cannot be quantified.
+            raise ValueError(
+                f"lambdas must include 0.0 as the control point, got {list(self.lambdas)}"
+            )
+        if list(self.lambdas) != sorted(self.lambdas):
+            raise ValueError(
+                f"lambdas must be ascending, got {list(self.lambdas)}; the frontier is read "
+                f"left to right and a shuffled manifest makes run names sort wrongly"
+            )
+        return self
+
+
+def load_sweep(path: str | Path) -> SweepSpec:
+    """Read a sweep manifest. Same error contract as `load_config`."""
+    target = Path(path)
+    try:
+        return SweepSpec(**_load_yaml(target))  # type: ignore[arg-type]
+    except ValueError as exc:
+        raise ConfigError(f"invalid sweep manifest {target}:\n{exc}") from exc
+
+
+def sweep_points(spec: SweepSpec, *, root: str | Path | None = None) -> tuple[SweepPoint, ...]:
+    """Expand a manifest into one ready-to-run config per lambda.
+
+    `spec.base` is loaded **once** and then varied with `Config.with_lambda`, so
+    the N configs are structurally identical apart from that one float. Loading
+    the YAML N times would admit a difference between runs if a file changed
+    mid-sweep, which is exactly the kind of thing that is invisible afterwards.
+
+    `root` resolves the manifest's relative paths; it defaults to the current
+    directory, matching how `load_config` is called from the repo root.
+    """
+    base_dir = Path(root) if root is not None else Path()
+    shared = load_config(*[base_dir / path for path in spec.base])
+    return tuple(
+        SweepPoint(
+            lambda_value=value,
+            # `:g` so 0.0 reads as "0" and 0.02 as "0.02" - these names become
+            # W&B run names and directory names, and "lam0.000000" is unreadable.
+            run_name=f"{spec.name}-lam{value:g}",
+            config=shared.with_lambda(value),
+        )
+        for value in spec.lambdas
+    )

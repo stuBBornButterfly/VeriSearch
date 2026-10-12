@@ -29,6 +29,8 @@ from verisearch.config import (
     RewardConfig,
     TrainConfig,
     load_config,
+    load_sweep,
+    sweep_points,
 )
 
 if TYPE_CHECKING:
@@ -434,3 +436,140 @@ def test_four_bit_with_bfloat16_is_fine() -> None:
         load_in_4bit=True,
     )
     assert config.load_in_4bit is True
+
+
+# ---------------------------------------------------------------------------
+# The committed config files
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs"
+
+
+@pytest.mark.parametrize("overlay", ["dev_1.5b.yaml", "train_3b.yaml"])
+def test_committed_overlays_compose_onto_base(overlay: str) -> None:
+    """Every committed overlay must load. A broken one fails at launch, not here.
+
+    PROJECT.md section 3 puts config in data precisely so a bad value is caught
+    by validation; that is worth nothing if no test ever loads the files.
+    """
+    config = load_config(CONFIG_DIR / "base.yaml", CONFIG_DIR / overlay)
+    assert config.seed == 42
+
+
+def test_dev_overlay_is_cheaper_than_base_without_changing_the_experiment() -> None:
+    """A dev setting that leaked into a reported number would be unfindable."""
+    base = load_config(CONFIG_DIR / "base.yaml")
+    dev = load_config(CONFIG_DIR / "base.yaml", CONFIG_DIR / "dev_1.5b.yaml")
+
+    assert dev.env.max_new_tokens < base.env.max_new_tokens
+    assert dev.train.max_steps < base.train.max_steps
+    assert dev.eval.bootstrap_resamples < base.eval.bootstrap_resamples
+
+    # Untouched: everything the experiment measures.
+    assert dev.reward == base.reward
+    assert dev.train.group_size == base.train.group_size
+    assert dev.train.kl_beta == base.train.kl_beta
+    assert dev.train.learning_rate == base.train.learning_rate
+
+
+def test_final_overlay_selects_the_3b_policy() -> None:
+    config = load_config(CONFIG_DIR / "base.yaml", CONFIG_DIR / "train_3b.yaml")
+    assert config.model.policy == "Qwen2.5-3B-Instruct"
+    assert config.model.policy_repo == "Qwen/Qwen2.5-3B-Instruct"
+    assert config.train.group_size == 8
+
+
+def test_overlays_differ_in_fingerprint() -> None:
+    """`fingerprint` is what ties a logged run to its configuration."""
+    dev = load_config(CONFIG_DIR / "base.yaml", CONFIG_DIR / "dev_1.5b.yaml")
+    final = load_config(CONFIG_DIR / "base.yaml", CONFIG_DIR / "train_3b.yaml")
+    assert dev.fingerprint != final.fingerprint
+
+
+# ---------------------------------------------------------------------------
+# Sweep manifest
+# ---------------------------------------------------------------------------
+
+
+def test_committed_sweep_manifest_is_the_four_points_from_project_md() -> None:
+    spec = load_sweep(CONFIG_DIR / "sweep_lambda.yaml")
+    assert spec.lambdas == (0.0, 0.02, 0.05, 0.1)
+    assert spec.name == "lambda_frontier"
+
+
+def test_sweep_points_vary_only_lambda() -> None:
+    """The entire claim of the frontier plot, asserted."""
+    spec = load_sweep(CONFIG_DIR / "sweep_lambda.yaml")
+    points = sweep_points(spec, root=CONFIG_DIR.parent)
+
+    assert [point.lambda_value for point in points] == [0.0, 0.02, 0.05, 0.1]
+    assert [point.run_name for point in points] == [
+        "lambda_frontier-lam0",
+        "lambda_frontier-lam0.02",
+        "lambda_frontier-lam0.05",
+        "lambda_frontier-lam0.1",
+    ]
+
+    stripped = {
+        point.config.model_copy(
+            update={"reward": point.config.reward.model_copy(update={"lambda_retrieval_cost": 0.0})}
+        ).fingerprint
+        for point in points
+    }
+    assert len(stripped) == 1, "runs differ in something other than lambda"
+    assert len({point.config.fingerprint for point in points}) == 4
+
+
+def test_sweep_points_use_the_manifest_base_files() -> None:
+    spec = load_sweep(CONFIG_DIR / "sweep_lambda.yaml")
+    points = sweep_points(spec, root=CONFIG_DIR.parent)
+    assert all(point.config.model.policy == "Qwen2.5-3B-Instruct" for point in points)
+
+
+def write_sweep(tmp_path: Path, **overrides: object) -> Path:
+    payload: dict[str, object] = {
+        "name": "s",
+        "base": ["configs/base.yaml"],
+        "lambdas": [0.0, 0.1],
+        "output_dir": "results/raw/s",
+    }
+    payload.update(overrides)
+    target = tmp_path / "sweep.yaml"
+    target.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    return target
+
+
+def test_duplicate_lambdas_are_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="must be distinct"):
+        load_sweep(write_sweep(tmp_path, lambdas=[0.0, 0.05, 0.05]))
+
+
+def test_sweep_without_the_zero_control_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match=r"must include 0\.0 as the control point"):
+        load_sweep(write_sweep(tmp_path, lambdas=[0.02, 0.05]))
+
+
+def test_unsorted_lambdas_are_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="must be ascending"):
+        load_sweep(write_sweep(tmp_path, lambdas=[0.1, 0.0]))
+
+
+def test_single_lambda_is_not_a_sweep(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="at least 2 items"):
+        load_sweep(write_sweep(tmp_path, lambdas=[0.0]))
+
+
+def test_negative_lambda_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="must be non-negative"):
+        load_sweep(write_sweep(tmp_path, lambdas=[-0.1, 0.0]))
+
+
+def test_sweep_manifest_rejects_unknown_keys(tmp_path: Path) -> None:
+    """`extra="forbid"`: a typo in a manifest must not silently do nothing."""
+    with pytest.raises(ConfigError, match="lamdas"):
+        load_sweep(write_sweep(tmp_path, lamdas=[0.0, 0.1]))
+
+
+def test_missing_sweep_manifest_is_a_config_error(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError):
+        load_sweep(tmp_path / "absent.yaml")
