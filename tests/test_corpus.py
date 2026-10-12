@@ -25,11 +25,16 @@ from verisearch.data.build_corpus import (
     load_corpus,
     normalize_title,
     paragraphs_from_context,
-    spec_for,
     summarize_corpus,
     write_corpus,
 )
-from verisearch.data.datasets import DATASET_SPECS, DataError, Distribution, QAExample
+from verisearch.data.datasets import (
+    DATASET_SPECS,
+    DataError,
+    Distribution,
+    QAExample,
+    spec_for,
+)
 
 SPEC = DATASET_SPECS["hotpotqa"]
 

@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from verisearch.data.datasets import DATASET_SPECS, DataError, DatasetSpec
+from verisearch.data.datasets import DataError, DatasetSpec, spec_for
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -332,20 +332,6 @@ def load_corpus(path: str | Path) -> tuple[CorpusDoc, ...]:
             except ValueError as exc:
                 raise DataError(f"{target}:{lineno}: {exc}") from exc
     return tuple(docs)
-
-
-def spec_for(dataset: str) -> DatasetSpec:
-    """Look up a dataset spec by name, or raise listing the known names.
-
-    Split out of `build_corpus_from_hf` so the error path is reachable in CI:
-    the download itself is not, and a function that cannot run is a function
-    whose argument validation is never tested.
-    """
-    spec = DATASET_SPECS.get(dataset)
-    if spec is None:
-        known = ", ".join(sorted(DATASET_SPECS))
-        raise DataError(f"unknown dataset {dataset!r}. Known: {known}")
-    return spec
 
 
 def build_corpus_from_hf(  # pragma: no cover - needs the network and the [train] extra
