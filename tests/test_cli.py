@@ -18,13 +18,15 @@ return 2, not raise. A traceback reaching the user is a bug in the CLI.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
+import sys
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
-from verisearch.cli import CONTEXT_FILENAME, main
+from verisearch.cli import CONTEXT_FILENAME, _force_utf8, main
 from verisearch.data.datasets import Distribution, QAExample, Split, write_jsonl
 from verisearch.eval.baselines import BaselineKind, EvalContext, context_for
 from verisearch.eval.frontier import REPORT_FILENAME
@@ -835,3 +837,34 @@ def test_asking_for_a_figure_without_matplotlib_fails_cleanly(
     else:  # pragma: no cover - only when the [plot] extra is installed
         assert code == 0
         assert (tmp_path / "frontier.png").is_file()
+
+
+def test_force_utf8_reconfigures_a_real_text_stream_and_leaves_a_fake_one_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both arms of the isinstance guard, because only one runs under pytest.
+
+    `_force_utf8` exists so the frontier table's lambda column survives a cp1252
+    console. It is guarded by an isinstance check rather than a try/except
+    because pytest replaces `sys.stdout` with a capture object that has no
+    `reconfigure` - which means the normal test run only ever exercises the
+    branch that does nothing, and the branch that does the actual work would
+    ship unexercised.
+    """
+    fake = io.StringIO()  # no `reconfigure`, like pytest's capture object
+    monkeypatch.setattr(sys, "stdout", fake)
+    monkeypatch.setattr(sys, "stderr", fake)
+    _force_utf8()
+    assert not fake.closed  # the guard skipped it rather than raising
+
+    path = tmp_path / "out.txt"
+    with path.open("w", encoding="cp1252") as raw:
+        assert isinstance(raw, io.TextIOWrapper)
+        monkeypatch.setattr(sys, "stdout", raw)
+        monkeypatch.setattr(sys, "stderr", raw)
+        _force_utf8()
+        assert raw.encoding.lower() in {"utf-8", "utf8"}
+        # The point of the reconfigure: this is what used to arrive as λ.
+        raw.write("λ=0.05")
+
+    assert path.read_text(encoding="utf-8") == "λ=0.05"
