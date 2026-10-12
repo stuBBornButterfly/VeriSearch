@@ -1,0 +1,39 @@
+# Final-run overlay. Owner: Ayesha. Compose on top of base.yaml:
+#
+#     load_config("configs/base.yaml", "configs/train_3b.yaml")
+#
+# This is the configuration every reported number comes from. PROJECT.md
+# section 5 names Qwen2.5-3B-Instruct as the final policy and section 15 forbids
+# a number in any document that did not come from a logged run - so log
+# `Config.fingerprint` beside every run produced from this file.
+#
+# It deliberately does not set `lambda_retrieval_cost`. The four sweep points
+# come from `sweep_lambda.yaml` via `Config.with_lambda`, so that the only
+# difference between the four runs is one float and the frontier plot is
+# comparing what it claims to compare.
+
+model:
+  policy: Qwen2.5-3B-Instruct
+  policy_repo: Qwen/Qwen2.5-3B-Instruct
+  dtype: bfloat16
+  # 3B in bf16 is ~6 GB of weights before optimiser state, gradients and the
+  # vLLM KV cache. Whether this needs to be true is a function of the GPU that
+  # ends up running it, which is not decided yet (README hardware report). Left
+  # false so the honest configuration is the default and enabling quantisation
+  # is a visible, reviewed change rather than a silent one.
+  load_in_4bit: false
+
+env:
+  max_new_tokens: 512
+  search_budget: 4
+  max_turns: 6
+
+train:
+  group_size: 8
+  kl_beta: 0.04
+  learning_rate: 1.0e-6
+  max_steps: 1000
+
+eval:
+  bootstrap_resamples: 1000
+  confidence_level: 0.95
