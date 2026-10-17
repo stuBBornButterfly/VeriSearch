@@ -239,6 +239,52 @@ class EvalConfig(BaseModel):
     confidence_level: float = Field(gt=0.0, lt=1.0)
 
 
+class ServeConfig(BaseModel):
+    """The policy server and its load benchmark. PROJECT.md section 9, serving row.
+
+    `concurrency_levels` is not validated against section 9's `1, 8, 32` here:
+    an overlay that runs a cheap two-level smoke benchmark is legitimate, and
+    `tests/test_config.py` holds `configs/base.yaml` itself to section 9. The
+    same goes for `requests_per_level` and the p99 floor - a small run reports
+    p99 as `n/a`, which is honest; the base config is what must allow a real one.
+    """
+
+    model_config = _SECTION
+
+    # The policy server (`serve/server.py`). Not vLLM, and not retrieval.
+    url: str
+    concurrency_levels: tuple[int, ...] = Field(min_length=1)
+    requests_per_level: int = Field(ge=1)
+    warmup_requests: int = Field(ge=0)
+    request_timeout_s: float = Field(gt=0.0)
+    throughput_batches: int = Field(ge=2)
+
+    @model_validator(mode="after")
+    def _check_levels(self) -> Self:
+        levels = self.concurrency_levels
+        if any(level < 1 for level in levels):
+            raise ValueError(f"concurrency levels must be >= 1, got {list(levels)}")
+        if list(levels) != sorted(set(levels)):
+            # Sorted because levels run in order and take consecutive slices of
+            # the question pool; a duplicate would be the same row measured twice
+            # under one label, with the second one on a warmer cache.
+            raise ValueError(f"concurrency levels must be strictly increasing, got {list(levels)}")
+        return self
+
+    @model_validator(mode="after")
+    def _check_warmup_covers_a_wave(self) -> Self:
+        # The first wave at the highest level is the coldest: every worker's
+        # first request lands at once on a server that has never batched that
+        # many. Warmup shorter than that wave leaves some of it in the sample.
+        widest = max(self.concurrency_levels)
+        if self.warmup_requests < widest:
+            raise ValueError(
+                f"warmup_requests={self.warmup_requests} is shorter than one wave at "
+                f"concurrency {widest}, so cold requests would be measured"
+            )
+        return self
+
+
 class LoggingConfig(BaseModel):
     """Weights & Biases. No credentials here - see the module docstring."""
 
@@ -273,6 +319,7 @@ class Config(BaseSettings):
     reward: RewardConfig
     train: TrainConfig
     eval: EvalConfig
+    serve: ServeConfig
     logging: LoggingConfig
 
     @classmethod

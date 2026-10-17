@@ -27,6 +27,7 @@ from verisearch.config import (
     PenaltyConfig,
     RetrievalConfig,
     RewardConfig,
+    ServeConfig,
     TrainConfig,
     load_config,
     load_sweep,
@@ -573,3 +574,87 @@ def test_sweep_manifest_rejects_unknown_keys(tmp_path: Path) -> None:
 def test_missing_sweep_manifest_is_a_config_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         load_sweep(tmp_path / "absent.yaml")
+
+
+# ---------------------------------------------------------------------------
+# serve: - PROJECT.md section 9, serving row
+# ---------------------------------------------------------------------------
+
+
+def _serve(**overrides: object) -> ServeConfig:
+    fields: dict[str, object] = {
+        "url": "http://127.0.0.1:8100",
+        "concurrency_levels": (1, 8, 32),
+        "requests_per_level": 500,
+        "warmup_requests": 32,
+        "request_timeout_s": 120.0,
+        "throughput_batches": 10,
+    }
+    fields.update(overrides)
+    return ServeConfig.model_validate(fields)
+
+
+def test_the_base_config_benchmarks_at_section_9s_three_levels() -> None:
+    """Section 9: "at concurrency 1, 8, 32". The model allows other levels on
+    purpose, for smoke overlays - so the committed base is held to it here."""
+    assert load_config().serve.concurrency_levels == (1, 8, 32)
+
+
+def test_the_base_config_sends_enough_requests_for_a_real_p99() -> None:
+    """Section 9 asks for p99, and the benchmark only reports one with five
+    observations above it. The base config must make that possible."""
+    from verisearch.serve.benchmark import min_samples_for
+
+    assert load_config().serve.requests_per_level >= min_samples_for(0.99)
+
+
+def test_the_policy_server_does_not_share_a_port_with_retrieval() -> None:
+    config = load_config()
+    assert config.serve.url != config.retrieval.service_url
+
+
+@pytest.mark.parametrize(
+    "levels",
+    [
+        pytest.param((8, 1, 32), id="unsorted"),
+        pytest.param((1, 8, 8), id="duplicate"),
+    ],
+)
+def test_concurrency_levels_must_be_strictly_increasing(levels: tuple[int, ...]) -> None:
+    """A duplicate is one row measured twice under one label, the second on a
+    warmer cache."""
+    with pytest.raises(ValidationError, match="strictly increasing"):
+        _serve(concurrency_levels=levels)
+
+
+def test_a_concurrency_level_below_one_is_rejected() -> None:
+    with pytest.raises(ValidationError, match=">= 1"):
+        _serve(concurrency_levels=(0, 8))
+
+
+def test_concurrency_levels_cannot_be_empty() -> None:
+    with pytest.raises(ValidationError):
+        _serve(concurrency_levels=())
+
+
+@pytest.mark.parametrize(
+    ("warmup", "ok"),
+    [
+        pytest.param(32, True, id="one-full-wave"),
+        pytest.param(64, True, id="two-waves"),
+        pytest.param(31, False, id="one-short"),
+    ],
+)
+def test_warmup_must_cover_a_full_wave_at_the_highest_level(warmup: int, ok: bool) -> None:
+    """The first wave at concurrency 32 is the coldest moment of the whole run."""
+    if ok:
+        assert _serve(warmup_requests=warmup).warmup_requests == warmup
+    else:
+        with pytest.raises(ValidationError, match="shorter than one wave"):
+            _serve(warmup_requests=warmup)
+
+
+def test_a_smoke_overlay_with_small_counts_is_allowed() -> None:
+    """Honest at runtime rather than refused here: p99 comes out n/a."""
+    smoke = _serve(concurrency_levels=(1, 2), requests_per_level=20, warmup_requests=2)
+    assert smoke.requests_per_level == 20

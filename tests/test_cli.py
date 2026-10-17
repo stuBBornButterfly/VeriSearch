@@ -6,10 +6,11 @@ package rather than in the `.sh` files: a bash script that decides anything
 cannot be tested, and these decide which index a report was measured against and
 whether a sweep is complete.
 
-Three of the four commands run end to end with no optional extras installed:
-`eval-context`, `eval-report` and `frontier`. `build-index` is driven to the
-point just before the embedder loads, which is the only line in the module that
-needs torch.
+Four of the five commands run end to end with no optional extras installed:
+`eval-context`, `eval-report`, `frontier` and `serve-bench` - the last against
+`serve.local`'s stdlib server and a fake policy, over a real socket.
+`build-index` is driven to the point just before the embedder loads, which is
+the only line in the module that needs torch.
 
 Every assertion on stderr matters: an expected failure must print one line and
 return 2, not raise. A traceback reaching the user is a bug in the CLI.
@@ -27,13 +28,19 @@ import numpy as np
 import pytest
 
 from verisearch.cli import CONTEXT_FILENAME, _force_utf8, main
+from verisearch.config import DEFAULT_CONFIG_PATH
 from verisearch.data.datasets import Distribution, QAExample, Split, write_jsonl
 from verisearch.eval.baselines import BaselineKind, EvalContext, context_for
 from verisearch.eval.frontier import REPORT_FILENAME
 from verisearch.eval.harness import EvalReport, score_example, write_results
 from verisearch.eval.metrics import ConfidenceInterval, FailureReason
+from verisearch.retrieval.client import RetrievalError
 from verisearch.retrieval.embedder import EmbedderSpec, l2_normalize
 from verisearch.retrieval.index import BruteForceIndex
+from verisearch.serve.benchmark import REPORT_FILENAME as BENCH_FILENAME
+from verisearch.serve.benchmark import REQUESTS_FILENAME, TABLE_HEADER, BenchReport
+from verisearch.serve.local import FakePolicyRunner, make_policy_server, serving
+from verisearch.serve.server import handle_health
 from verisearch.types import Passage, Termination, Trajectory, Turn, TurnKind
 
 if TYPE_CHECKING:
@@ -868,3 +875,223 @@ def test_force_utf8_reconfigures_a_real_text_stream_and_leaves_a_fake_one_alone(
         raw.write("λ=0.05")
 
     assert path.read_text(encoding="utf-8") == "λ=0.05"
+
+
+# ---------------------------------------------------------------------------
+# serve-bench
+# ---------------------------------------------------------------------------
+
+SERVE_HEALTH = handle_health(
+    policy="Qwen/Qwen2.5-1.5B-Instruct",
+    adapter="ckpt/step-1000",
+    hardware="test-cpu",
+    config_fingerprint="abc123def456",
+)
+
+
+def write_serve_overlay(
+    path: Path,
+    *,
+    url: str | None = None,
+    levels: tuple[int, ...] = (1, 2),
+    requests: int = 20,
+    warmup: int = 2,
+) -> Path:
+    """A cheap `serve:` section on top of `configs/base.yaml`."""
+    lines = [
+        "serve:",
+        f"  concurrency_levels: [{', '.join(str(level) for level in levels)}]",
+        f"  requests_per_level: {requests}",
+        f"  warmup_requests: {warmup}",
+        "  request_timeout_s: 10",
+        "  throughput_batches: 4",
+        "eval:",
+        "  bootstrap_resamples: 100",
+    ]
+    if url is not None:
+        lines.insert(1, f"  url: {url}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def serve_bench_argv(tmp_path: Path, overlay: Path, *extra: str) -> list[str]:
+    return [
+        "serve-bench",
+        "--examples",
+        str(write_examples(tmp_path / "dev.jsonl", n=3)),
+        "--config",
+        str(DEFAULT_CONFIG_PATH),
+        str(overlay),
+        "--out",
+        str(tmp_path / "serve"),
+        "--table",
+        str(tmp_path / "serving.md"),
+        *extra,
+    ]
+
+
+class FailsOnOneQuestion:
+    """A policy whose retrieval dies for one particular question."""
+
+    def __init__(self, bad: str) -> None:
+        self._bad = bad
+        self._inner = FakePolicyRunner()
+
+    def run(self, question_id: str, question: str) -> Trajectory:
+        if question == self._bad:
+            raise RetrievalError("index unavailable")
+        return self._inner.run(question_id, question)
+
+
+@pytest.mark.integration
+def test_serve_bench_measures_every_level_and_exits_0_on_a_publishable_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The full path at section 9's request count, so p99 is real and the
+    command can say the table is publishable. 500 per level is what it takes.
+
+    The small delay is what makes four requests genuinely overlap on the
+    server, so `concurrency_reached` is earned rather than lucky.
+    """
+    runner = FakePolicyRunner(delay_s=0.002)
+    overlay = write_serve_overlay(tmp_path / "serve.yaml", levels=(1, 4), requests=500, warmup=4)
+    with serving(make_policy_server(runner, SERVE_HEALTH)) as url:
+        code = main(serve_bench_argv(tmp_path, overlay, "--url", url))
+
+    out = capsys.readouterr()
+    assert code == 0, out.err
+    assert runner.calls == 2 * (500 + 4)
+    assert "hardware    test-cpu" in out.out
+    assert "adapter ckpt/step-1000" in out.out
+
+    table = (tmp_path / "serving.md").read_text(encoding="utf-8")
+    assert table.startswith(TABLE_HEADER)
+    assert "| 1 | " in table
+    assert "| 4 | " in table
+    assert "n/a" not in table
+    assert "`test-cpu`" in table
+
+    report = BenchReport.model_validate_json(
+        (tmp_path / "serve" / BENCH_FILENAME).read_text(encoding="utf-8")
+    )
+    assert report.server == SERVE_HEALTH
+    assert report.problems() == ()
+    rows = (tmp_path / "serve" / REQUESTS_FILENAME).read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 2 * (500 + 4)
+
+
+@pytest.mark.integration
+def test_serve_bench_plan_reads_health_and_sends_no_load(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runner = FakePolicyRunner()
+    overlay = write_serve_overlay(tmp_path / "serve.yaml")
+    with serving(make_policy_server(runner, SERVE_HEALTH)) as url:
+        code = main(["--plan", *serve_bench_argv(tmp_path, overlay, "--url", url)])
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert runner.calls == 0
+    assert "no load sent" in out
+    assert "44 in all" in out  # 2 levels x (20 + 2)
+    assert not (tmp_path / "serve").exists()
+    assert not (tmp_path / "serving.md").exists()
+
+
+@pytest.mark.integration
+def test_serve_bench_too_small_for_p99_writes_everything_and_exits_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A smoke run is useful and is not section 9's table. It says which."""
+    overlay = write_serve_overlay(tmp_path / "serve.yaml")
+    with serving(make_policy_server(FakePolicyRunner(), SERVE_HEALTH)) as url:
+        code = main(serve_bench_argv(tmp_path, overlay, "--url", url))
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "p99 needs 500 successful requests" in err
+    assert (tmp_path / "serving.md").is_file()
+    assert (tmp_path / "serve" / REQUESTS_FILENAME).is_file()
+
+
+@pytest.mark.integration
+def test_serve_bench_counts_failed_requests_and_refuses_the_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    overlay = write_serve_overlay(tmp_path / "serve.yaml", levels=(1,))
+    runner = FailsOnOneQuestion("Question 1?")
+    with serving(make_policy_server(runner, SERVE_HEALTH)) as url:
+        code = main(serve_bench_argv(tmp_path, overlay, "--url", url))
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "HTTP 503" in err
+    table = (tmp_path / "serving.md").read_text(encoding="utf-8")
+    # 20 measured requests cycle three questions from index 2, so "Question 1?"
+    # is asked at indices 4, 7, ... 19 - six times.
+    assert "| 6 / 20 |" in table
+
+
+@pytest.mark.integration
+def test_serve_bench_takes_the_url_from_the_config_when_no_flag_is_given(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with serving(make_policy_server(FakePolicyRunner(), SERVE_HEALTH)) as url:
+        overlay = write_serve_overlay(tmp_path / "serve.yaml", url=url)
+        code = main(["--plan", *serve_bench_argv(tmp_path, overlay)])
+
+    assert code == 0
+    assert f"server      {url}" in capsys.readouterr().out
+
+
+def test_serve_bench_against_nothing_says_so_in_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    overlay = write_serve_overlay(tmp_path / "serve.yaml")
+    code = main(serve_bench_argv(tmp_path, overlay, "--url", "http://127.0.0.1:9"))
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert err.count("\n") == 1
+    assert not (tmp_path / "serve").exists()
+
+
+def test_serve_bench_rejects_a_serve_section_that_breaks_its_rules(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    overlay = write_serve_overlay(tmp_path / "serve.yaml", levels=(1, 8), warmup=2)
+    code = main(serve_bench_argv(tmp_path, overlay, "--url", "http://127.0.0.1:9"))
+
+    assert code == 2
+    assert "shorter than one wave" in capsys.readouterr().err
+
+
+def test_serve_bench_refuses_an_unsendable_question_before_any_load(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One over-long question in the eval set must stop the run up front, not an
+    hour into the second level."""
+    examples = tmp_path / "long.jsonl"
+    write_jsonl(
+        [
+            QAExample(
+                question_id="q-long",
+                question="x" * 5000,
+                answers=("Ada Lovelace",),
+                dataset="hotpotqa",
+                distribution=Distribution.IN_DISTRIBUTION,
+            )
+        ],
+        examples,
+    )
+    runner = FakePolicyRunner()
+    overlay = write_serve_overlay(tmp_path / "serve.yaml")
+    argv = serve_bench_argv(tmp_path, overlay)
+    argv[argv.index("--examples") + 1] = str(examples)
+    with serving(make_policy_server(runner, SERVE_HEALTH)) as url:
+        code = main([*argv, "--url", url])
+
+    assert code == 2
+    assert "cannot be sent" in capsys.readouterr().err
+    assert runner.calls == 0
+    assert not (tmp_path / "serve").exists()

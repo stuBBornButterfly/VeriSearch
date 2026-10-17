@@ -38,9 +38,9 @@ FIGURE=results/figures/frontier.png scripts/04_sweep.sh
 scripts/05_serve_bench.sh
 ```
 
-`EvalReport.summary()`, `Comparison.summary()` and `frontier_table()` are the
-three functions that produce these numbers. If a row here has no function behind
-it, that row is the bug.
+`EvalReport.summary()`, `Comparison.summary()`, `frontier_table()` and
+`BenchReport.table()` are the four functions that produce these numbers. If a
+row here has no function behind it, that row is the bug.
 
 `tests/test_report.py` checks this file against the code: every metric field on
 `EvalReport`, every `BaselineKind`, every `FailureReason`, every `Comparison`
@@ -335,20 +335,45 @@ Section 2 requires 3+ documented failure cases. Count so far: `{{n-failure-cases
 
 ## 8. Serving
 
-Section 9's serving metrics, P5. vLLM, measured at three concurrency levels on
-the hardware named in section 2.
+Section 9's serving metrics, P5: the trained policy behind vLLM, measured end to
+end at three concurrency levels. One request is one question and one whole
+episode - every generate call, every retrieval round trip - because that is the
+system this project built. A `/v1/completions` benchmark would time the part
+vLLM already benchmarks.
 
-<!-- generated: scripts/05_serve_bench.sh -->
+<!-- generated: scripts/05_serve_bench.sh (BenchReport.table) -->
 
-| Concurrency | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) |
-|---|---|---|---|---|
-| 1 | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` |
-| 8 | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` |
-| 32 | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` |
+| Concurrency | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) | Answered | Failed |
+|---|---|---|---|---|---|---|
+| 1 | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` |
+| 8 | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` |
+| 32 | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` | `{{?}}` |
+
+`{{serve-footer}}`
+
+How to read it:
+
+- **Every cell is a point estimate and its 95% interval.** Latency percentiles
+  use a percentile bootstrap over requests; throughput uses batch means over
+  slices of the measured window, because requests are not independent samples
+  of a rate.
+- **A percentile needs a tail.** p99 is reported only with at least five
+  requests above it, so 500 per level; below that the cell says `n/a` rather
+  than printing a maximum under another name.
+- **Answered** is the fraction of successful requests whose episode reached
+  `<answer>`. A policy that gives up early is fast, and this column is what
+  stops that from reading as good latency.
+- **Failed** is counted, never dropped. Latency is computed over successful
+  requests only, so a row with any failure is not this table, and the script
+  exits 1 on it.
+- **Throughput is biased low.** Warmup requests still in flight when the window
+  opens finish uncounted, and the window closes on a drain. Both edges cost
+  completions; neither adds any.
 
 A latency number is not comparable across machines, so the hardware line is part
-of the result and not a footnote. Measured on `{{serve-hardware}}` with
-`{{serve-model}}`.
+of the result and not a footnote. The script prints it under the table, read
+from the policy server's `/health` - the machine that answered, not the one the
+script was launched from.
 
 ---
 
