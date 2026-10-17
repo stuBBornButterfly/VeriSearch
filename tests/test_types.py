@@ -7,6 +7,10 @@ contract, these change with it. Table-driven per PROJECT.md section 3.
 
 from __future__ import annotations
 
+import collections.abc
+import typing
+from collections.abc import Sequence
+
 import pytest
 from pydantic import ValidationError
 
@@ -14,6 +18,8 @@ from verisearch.types import (
     Claim,
     Entailment,
     FaithfulnessResult,
+    FaithfulnessScorer,
+    ParseFailure,
     Passage,
     RewardBreakdown,
     ScoredTrajectory,
@@ -227,3 +233,153 @@ def test_a_minimal_fake_satisfies_the_retriever_shape() -> None:
 
     retriever: Retriever = FakeRetriever()
     assert len(retriever.search("anything", k=3)) == 3
+
+
+# ---------------------------------------------------------------------------
+# Review findings on PR #2. Each test names the finding it closes.
+# ---------------------------------------------------------------------------
+
+
+def _ended(termination: Termination, **extra: object) -> Trajectory:
+    """A trajectory that ended some way other than by answering."""
+    return Trajectory(
+        question_id="hpqa-0002",
+        question="Who directed the film?",
+        gold_answers=("Peter Weir",),
+        turns=(Turn(kind=TurnKind.THINK, text="..."),),
+        answer=None,
+        termination=termination,
+        **extra,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize("failure", list(ParseFailure))
+def test_every_parse_failure_category_can_reach_a_reader(failure: ParseFailure) -> None:
+    """Finding 1. The enum existed and no model had a field of that type.
+
+    A category that cannot be stored cannot be counted, and section 9 asks for a
+    failure breakdown while section 3 asks for a parser test per category.
+    """
+    traj = _ended(Termination.PARSE_ERROR, parse_failure=failure)
+    assert traj.parse_failure is failure
+
+
+def test_a_parse_error_must_name_which_failure() -> None:
+    """Finding 1, the half that keeps the field from going unused again.
+
+    `Termination.PARSE_ERROR` on its own says parsing failed and nothing more.
+    """
+    with pytest.raises(ValidationError, match="parse_failure"):
+        _ended(Termination.PARSE_ERROR)
+
+
+@pytest.mark.parametrize(
+    "termination",
+    [Termination.ANSWERED, Termination.MAX_TURNS, Termination.SEARCH_BUDGET_EXHAUSTED],
+)
+def test_an_episode_that_parsed_carries_no_parse_failure(termination: Termination) -> None:
+    """The validator constrains one termination, not every trajectory."""
+    assert _ended(termination).parse_failure is None
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "same"),
+    [
+        pytest.param("Sam Mendes birthplace", "Sam Mendes birthplace ", True, id="trailing-space"),
+        pytest.param("Sam Mendes birthplace", "sam mendes birthplace", True, id="case"),
+        pytest.param("Sam Mendes birthplace", "Sam Mendes' birthplace", True, id="punctuation"),
+        pytest.param("birthplace of director", "birthplace of the director", True, id="article"),
+        pytest.param("Pedro Almodovar films", "Pedro Almodóvar films", True, id="accent"),
+        pytest.param("a  b", "a b", True, id="inner-whitespace"),
+        pytest.param("Sam Mendes birthplace", "Sam Mendes birth year", False, id="different"),
+        pytest.param("1999 winner", "1998 winner", False, id="digits-matter"),
+    ],
+)
+def test_duplicate_queries_are_counted_on_a_normalised_form(
+    first: str, second: str, *, same: bool
+) -> None:
+    """Finding 2. Raw string comparison makes the -0.1 penalty dodgeable.
+
+    The hack is cheap enough for a policy to find by accident, and it would show
+    up as a duplicate-query rate that falls during training while the behaviour
+    behind it does not change at all.
+    """
+    traj = _trajectory(
+        Turn(kind=TurnKind.SEARCH, text=first),
+        Turn(kind=TurnKind.SEARCH, text=second),
+    )
+    assert traj.n_searches == 2
+    assert traj.n_duplicate_queries == (1 if same else 0)
+
+
+def test_normalisation_does_not_collapse_queries_that_differ_in_content() -> None:
+    """The guard on the other side: over-normalising charges a real refinement.
+
+    A false positive costs one unfair -0.1, which is the trade the aggressive
+    rule accepts - but only for queries that differ in form, never in content.
+    """
+    traj = _trajectory(
+        Turn(kind=TurnKind.SEARCH, text="American Beauty director"),
+        Turn(kind=TurnKind.SEARCH, text="American Beauty director birthplace"),
+        Turn(kind=TurnKind.SEARCH, text="American Beauty release year"),
+    )
+    assert traj.n_duplicate_queries == 0
+
+
+def test_a_scorer_can_take_the_trajectorys_own_passages() -> None:
+    """Finding 4. `retrieved_passages` is a tuple and the parameter took a list.
+
+    This is the call every consumer of the contract makes, and before the change
+    it needed a `list(...)` that existed only to satisfy the signature.
+    """
+
+    class TupleScorer:
+        def score(self, answer: str, passages: Sequence[Passage]) -> FaithfulnessResult:
+            label = Entailment.ENTAILED if passages else Entailment.NEUTRAL
+            return FaithfulnessResult(
+                claims=(Claim(text=answer, label=label),),
+                score=1.0 if passages else 0.0,
+            )
+
+    scorer: FaithfulnessScorer = TupleScorer()
+    traj = _trajectory(
+        Turn(kind=TurnKind.INFO, text="...", passages=(_passage("d1"),)),
+        Turn(kind=TurnKind.ANSWER, text="Peter Weir"),
+    )
+
+    result = scorer.score("Peter Weir", traj.retrieved_passages)
+    assert result.score == 1.0
+
+
+def test_the_faithfulness_protocol_accepts_any_sequence() -> None:
+    """Finding 4, pinned against the annotation so a revert is caught here."""
+    hints = typing.get_type_hints(FaithfulnessScorer.score)
+    assert typing.get_origin(hints["passages"]) is collections.abc.Sequence
+
+
+@pytest.mark.parametrize("field", ["components", "penalties"])
+def test_reward_mappings_are_declared_immutable(field: str) -> None:
+    """Finding 5. `frozen=True` stops `breakdown.components = {}` and not
+    `breakdown.components["correctness"] = 9.0`.
+
+    Pydantic still hands back a plain dict at runtime, so this is enforced by
+    `mypy --strict` and not by an exception - which is exactly why the guarantee
+    is pinned to the annotation here. Asserting on the runtime type would assert
+    the opposite of what is wanted.
+    """
+    annotation = RewardBreakdown.model_fields[field].annotation
+    assert typing.get_origin(annotation) is collections.abc.Mapping, (
+        f"RewardBreakdown.{field} is declared {annotation}, which lets a caller "
+        "mutate a frozen model's contents"
+    )
+
+
+def test_reward_breakdown_still_accepts_a_plain_dict() -> None:
+    """The annotation change must not cost callers anything at the call site."""
+    breakdown = RewardBreakdown(
+        components={"correctness": 1.0, "faithfulness": 0.5},
+        penalties={"duplicate_query": -0.1},
+        total=1.4,
+    )
+    assert breakdown.components["correctness"] == 1.0
+    assert breakdown.penalties["duplicate_query"] == -0.1
