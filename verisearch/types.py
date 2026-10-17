@@ -14,10 +14,13 @@ approve.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ---------------------------------------------------------------------------
 # Closed sets. PROJECT.md section 3: "Enums for closed sets."
@@ -72,6 +75,32 @@ class Entailment(StrEnum):
 # ---------------------------------------------------------------------------
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
+
+_QUERY_PUNCTUATION = re.compile(r"[^\w\s]")
+_QUERY_ARTICLES = re.compile(r"\b(a|an|the)\b")
+
+
+def _normalize_query(text: str) -> str:
+    """Canonical form for deciding that two searches are the same search.
+
+    Deliberately aggressive, for the same reason `data.normalize_question` is:
+    a false positive costs one unfair -0.1, while a false negative means the
+    duplicate penalty can be dodged with a space and section 6's retrieval-cost
+    mechanism leaks. Accents folded, case dropped, punctuation and articles
+    removed, whitespace collapsed.
+
+    How aggressive this should be is reward design and therefore Dhrubo's call -
+    strip-and-casefold is the floor he asked for and this is the ceiling. It is
+    one function to change.
+
+    Duplicated from `data.datasets.normalize_question` on purpose: `types.py` is
+    the base of the dependency graph and imports from no module in the package.
+    Both should move to a shared `verisearch/text.py` once one exists, along
+    with `eval.metrics.normalize_title`.
+    """
+    folded = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    depunctuated = _QUERY_PUNCTUATION.sub(" ", folded.lower())
+    return " ".join(_QUERY_ARTICLES.sub(" ", depunctuated).split())
 
 
 class Passage(BaseModel):
@@ -143,20 +172,33 @@ class FaithfulnessResult(BaseModel):
     model_config = _FROZEN
 
     claims: tuple[Claim, ...]
+    # DECIDED: `score` is 0.0 when `claims` is empty. Dhrubo's call, on #2, as
+    # reward design: 1.0 would be a safe harbour, paying `w_a * 1.0 = 0.5` for
+    # answering in unfalsifiable language, which beats trying and being partly
+    # unsupported. It does punish an honest "the passages do not say", which is
+    # accepted because correctness dominates and the canaries will show it.
+    # `tests/test_rewards.py` gets a case for it.
     score: float = Field(ge=0.0, le=1.0)
-    # DECIDE: what is `score` when `claims` is empty?
-    #   0.0  - punishes an answer with no checkable claims. Also punishes an
-    #          honest "the passages do not say", which may be behaviour we want.
-    #   1.0  - vacuously faithful. Invites a degenerate "I don't know" policy.
-    #   None - forces every caller to branch. Honest, and annoying.
-    # A reward-design question, not a typing one, so it belongs to the session.
-    # Whatever we pick, `tests/test_rewards.py` gets a case for it.
 
     @property
-    def unsupported_rate(self) -> float:
-        """Headline metric from PROJECT.md section 9. 0.0 when there are no claims."""
+    def unsupported_rate(self) -> float | None:
+        """Headline metric from PROJECT.md section 9. None when there are no claims.
+
+        Not 0.0. An answer with nothing checkable in it is not perfectly
+        faithful - it is unmeasured, and 0.0 is the best possible value this
+        metric can take. Reporting it would mean a policy that learned to answer
+        in unfalsifiable language appears at the top of the headline
+        hallucination number, which is the opposite of what section 9 asks this
+        metric to detect. It would also contradict `score` scoring that same
+        trajectory 0.0 - the two numbers describing one trajectory as both the
+        worst and the best possible.
+
+        None propagates: `eval.harness.aggregate` drops it from the mean rather
+        than counting it as a zero, and a run where it is None for every example
+        reports `n/a` instead of a flattering number nobody measured.
+        """
         if not self.claims:
-            return 0.0
+            return None
         unsupported = sum(1 for c in self.claims if c.label is not Entailment.ENTAILED)
         return unsupported / len(self.claims)
 
@@ -181,6 +223,29 @@ class Trajectory(BaseModel):
     turns: tuple[Turn, ...]
     answer: str | None
     termination: Termination
+    # Which parse failure ended the episode, when one did. `Termination` records
+    # *that* parsing failed and `ParseFailure` had no field until now, so the
+    # category existed in the type system and reached no reader: section 9 wants
+    # a failure breakdown and `eval.metrics.classify_failure` cannot recover the
+    # reason from anything else stored here. None for every episode that parsed.
+    parse_failure: ParseFailure | None = None
+
+    @model_validator(mode="after")
+    def _a_parse_error_says_which(self) -> Self:
+        """PARSE_ERROR without a reason is a row nobody can act on.
+
+        Beyond what the review asked for - the finding was the field alone. The
+        validator is what stops the field being optional in practice, which is
+        how `ParseFailure` became unreachable in the first place. Drop it if the
+        episode loop has a case where the category genuinely is not known.
+        """
+        if self.termination is Termination.PARSE_ERROR and self.parse_failure is None:
+            raise ValueError(
+                "termination=parse_error requires parse_failure to name the category; "
+                "section 3 requires a parser test per category and section 9 a failure "
+                "breakdown, and neither can be built from 'it failed'"
+            )
+        return self
 
     @property
     def search_queries(self) -> tuple[str, ...]:
@@ -193,9 +258,15 @@ class Trajectory(BaseModel):
 
     @property
     def n_duplicate_queries(self) -> int:
-        """Feeds the -0.1 duplicate-query penalty in PROJECT.md section 6."""
+        """Feeds the -0.1 duplicate-query penalty in PROJECT.md section 6.
+
+        Counted on a normalised form. Comparing raw strings makes the penalty
+        avoidable with a trailing space, which is a reward hack the policy can
+        find by accident and which would show up as a duplicate rate that falls
+        during training while the behaviour does not change.
+        """
         queries = self.search_queries
-        return len(queries) - len(set(queries))
+        return len(queries) - len({_normalize_query(q) for q in queries})
 
     @property
     def retrieved_passages(self) -> tuple[Passage, ...]:
@@ -223,8 +294,12 @@ class RewardBreakdown(BaseModel):
 
     model_config = _FROZEN
 
-    components: dict[str, float]
-    penalties: dict[str, float] = Field(default_factory=dict)
+    # `Mapping`, not `dict`. `frozen=True` blocks attribute assignment and not
+    # `breakdown.components["correctness"] = 9.0`, so a dict here is a mutable
+    # hole in a model section 3 calls immutable - and this is the object whose
+    # per-component values reach W&B and the trajectory dump.
+    components: Mapping[str, float]
+    penalties: Mapping[str, float] = Field(default_factory=dict)
     total: float
 
 
@@ -267,7 +342,11 @@ class Retriever(Protocol):
 class FaithfulnessScorer(Protocol):
     """Ayesha implements (NLI, offline). Never called inside the training hot loop."""
 
-    def score(self, answer: str, passages: list[Passage]) -> FaithfulnessResult: ...
+    # `Sequence`, not `list`: `Trajectory.retrieved_passages` is a tuple, so a
+    # `list` parameter means every caller writes `list(...)` to get past mypy -
+    # a cast that exists only to satisfy a signature. Returns stay `list`, which
+    # is the concrete type an implementation actually builds.
+    def score(self, answer: str, passages: Sequence[Passage]) -> FaithfulnessResult: ...
 
 
 class RewardComponent(Protocol):
