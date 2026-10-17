@@ -32,8 +32,14 @@ from typing import TYPE_CHECKING
 
 from verisearch.config import DEFAULT_CONFIG_PATH, ConfigError, load_config, load_sweep
 from verisearch.data.build_corpus import load_corpus, summarize_corpus
-from verisearch.data.datasets import DataError, load_jsonl
-from verisearch.eval.baselines import BaselineKind, EvalContext, EvalError, context_for
+from verisearch.data.datasets import DataError, Split, load_jsonl, write_jsonl
+from verisearch.eval.baselines import (
+    BaselineKind,
+    EvalContext,
+    EvalError,
+    context_for,
+    examples_fingerprint,
+)
 from verisearch.eval.frontier import (
     Frontier,
     diagnose,
@@ -41,7 +47,8 @@ from verisearch.eval.frontier import (
     load_sweep_results,
     pareto_frontier,
 )
-from verisearch.eval.harness import aggregate, read_results, write_report
+from verisearch.eval.harness import EvalRun, aggregate, load_run, read_results, write_report
+from verisearch.eval.regression import RegressionStatus, check_regression, regression_set
 from verisearch.retrieval.client import InMemoryDocStore, RetrievalError
 from verisearch.retrieval.embedder import DEFAULT_BATCH_SIZE, EmbedderError, EmbedderSpec
 from verisearch.retrieval.index import (
@@ -65,6 +72,9 @@ DEFAULT_EMBEDDER_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_EMBEDDER_DIM = 384
 
 CONTEXT_FILENAME = "context.json"
+# What `03_eval.sh` writes for every run, and so what a promoted reference holds.
+REPORT_JSON = "report.json"
+RESULTS_JSONL = "results.jsonl"
 
 # Every expected failure in this module is one of these. Anything else is a bug
 # and should reach the user as a traceback rather than a tidy message.
@@ -347,6 +357,99 @@ def _write_figure(curve: Frontier, path: str, title: str) -> int:
     return 0  # pragma: no cover - needs the [plot] extra
 
 
+def regression_set_command(args: argparse.Namespace) -> int:
+    """Write the fixed set `eval-regression` measures. Run once, then keep the file.
+
+    The file is the contract, the way `context.json` is for an experiment: the
+    reference and every nightly run are scored on exactly these questions. So it
+    refuses to overwrite one that exists. Rewriting it - even deterministically,
+    from a dev file that has since changed - makes the reference incomparable,
+    and `eval-regression` would then refuse every night until a new reference
+    is promoted.
+    """
+    out_path = Path(args.out)
+    if out_path.exists() and not args.force:
+        return _fail(
+            f"{out_path} already exists. It is the set the reference was scored on; "
+            f"pass --force only alongside promoting a new reference."
+        )
+    try:
+        examples = load_jsonl(Path(args.examples))
+        chosen = regression_set(examples, args.n, seed=args.seed, split=Split(args.split))
+    except _EXPECTED as exc:
+        return _fail(str(exc))
+
+    fingerprint = examples_fingerprint(example.question_id for example in chosen)
+    print(f"source      {args.examples}")
+    print(f"chosen      {len(chosen)} {args.split} examples, seed {args.seed}")
+    print(f"examples    fingerprint={fingerprint}")
+    if args.plan:
+        print("\nplan only, nothing written.")
+        return 0
+    write_jsonl(chosen, out_path)
+    print(f"\nwrote {out_path}")
+    return 0
+
+
+def eval_regression(args: argparse.Namespace) -> int:
+    """`scripts/03_eval.sh --regression`. Section 10's nightly `eval-regression`.
+
+    Exit 0 when F1 held or the drop is within noise, 1 when it regressed, 2 when
+    the comparison could not be made at all. A comparison that cannot be made is
+    never a pass: a missing reference, a reference from another set or another
+    index, and candidate rows for the wrong questions all exit 2.
+
+    The candidate's context is rebuilt here from the index's own `meta.json` and
+    the regression set, rather than copied from the reference - otherwise
+    `check_comparable` would be comparing the reference with itself.
+    """
+    reference_dir = Path(args.reference)
+    try:
+        examples = load_jsonl(Path(args.examples))
+        if len(examples) != args.n:
+            return _fail(
+                f"{args.examples} holds {len(examples)} examples, not the {args.n} this gate "
+                f"is defined on. Build it with `regression-set --n {args.n}`."
+            )
+        meta = load_meta(Path(args.index))
+        context = context_for(
+            [example.question_id for example in examples],
+            dataset=args.dataset,
+            split=args.split,
+            retriever_fingerprint=meta.embedder_fingerprint,
+            k=args.k,
+        )
+        reference = load_run(reference_dir / REPORT_JSON, reference_dir / RESULTS_JSONL)
+        rows = read_results(Path(args.candidate))
+        report = aggregate(
+            rows,
+            run_name=args.run_name,
+            kind=reference.report.kind,
+            context=context,
+            resamples=args.resamples,
+            seed=args.seed,
+        )
+        verdict = check_regression(
+            reference,
+            EvalRun(report=report, results=rows),
+            max_drop=args.max_f1_drop / 100.0,
+            resamples=args.resamples,
+            seed=args.seed,
+        )
+    except _EXPECTED as exc:
+        return _fail(str(exc))
+
+    print(verdict.summary())
+    if verdict.status is RegressionStatus.REGRESSED:
+        print(
+            f"\nREGRESSED: F1 fell {-verdict.f1_delta.point * 100:.1f} pts and the interval "
+            f"excludes zero",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def serve_bench(args: argparse.Namespace) -> int:
     """`scripts/05_serve_bench.sh`. Section 9's serving row, at every configured level.
 
@@ -480,6 +583,42 @@ def _add_frontier(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
     parser.set_defaults(handler=frontier)
 
 
+def _add_regression_set(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser(
+        "regression-set", help="write the fixed example set the nightly regression gate uses"
+    )
+    parser.add_argument("--examples", required=True, help="processed examples JSONL, splits set")
+    parser.add_argument("--n", type=int, default=100, help="section 10: 100")
+    parser.add_argument("--split", choices=tuple(split.value for split in Split), default="dev")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--out", default="data/regression/examples.jsonl")
+    parser.add_argument("--force", action="store_true", help="overwrite an existing set")
+    parser.set_defaults(handler=regression_set_command)
+
+
+def _add_eval_regression(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser(
+        "eval-regression", help="compare tonight's run with the reference on the fixed set"
+    )
+    parser.add_argument("--examples", required=True, help="the set from regression-set")
+    parser.add_argument("--index", required=True, help="index directory, read for its fingerprint")
+    parser.add_argument(
+        "--reference", required=True, help="directory holding report.json and results.jsonl"
+    )
+    parser.add_argument("--candidate", required=True, help="tonight's results JSONL on the set")
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--split", required=True)
+    parser.add_argument("--k", type=int, default=3)
+    parser.add_argument("--n", type=int, default=100, help="the size the gate is defined on")
+    parser.add_argument(
+        "--max-f1-drop", type=float, default=2.0, help="in F1 points; section 10 says 2"
+    )
+    parser.add_argument("--run-name", default="nightly")
+    parser.add_argument("--resamples", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.set_defaults(handler=eval_regression)
+
+
 def _add_serve_bench(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser(
         "serve-bench", help="load-benchmark the policy server at every configured concurrency"
@@ -519,6 +658,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_eval_context(subparsers)
     _add_eval_report(subparsers)
     _add_frontier(subparsers)
+    _add_regression_set(subparsers)
+    _add_eval_regression(subparsers)
     _add_serve_bench(subparsers)
     return parser
 

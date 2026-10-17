@@ -21,6 +21,21 @@
 #   RUN_NAME=prompted KIND=prompted_iterative RESULTS=results/raw/prompted.jsonl \
 #       scripts/03_eval.sh
 #   scripts/03_eval.sh --plan
+#   scripts/03_eval.sh --regression --n 100 --max-f1-drop 2.0
+#
+# --regression is section 10's nightly gate, and is a separate path: it skips
+# both steps above and compares CANDIDATE - tonight's rows on the fixed set -
+# with the promoted reference run. Its inputs:
+#
+#   REGRESSION_EXAMPLES   the fixed set, from `python -m verisearch.cli
+#                         regression-set` (once, then kept)
+#   REGRESSION_REFERENCE  a directory holding report.json and results.jsonl
+#                         from a known-good checkpoint on that set
+#   CANDIDATE             tonight's results.jsonl on the same set. Producing it
+#                         means running the policy, which needs the episode loop.
+#
+# A nightly agent starts from a fresh workspace, so on the GPU machine point
+# these, and INDEX, at paths that outlive a build.
 #
 # Owner: Ayesha.
 set -euo pipefail
@@ -39,15 +54,37 @@ KIND="${KIND:-}"
 RESULTS="${RESULTS:-}"
 REPORT="${REPORT:-}"
 
+REGRESSION_EXAMPLES="${REGRESSION_EXAMPLES:-data/regression/examples.jsonl}"
+REGRESSION_REFERENCE="${REGRESSION_REFERENCE:-data/regression/reference}"
+CANDIDATE="${CANDIDATE:-${RESULTS_DIR}/regression/candidate.jsonl}"
+
 PLAN=()
 ARGS=()
+REGRESSION=""
 for arg in "$@"; do
   if [[ "$arg" == "--plan" ]]; then
     PLAN=(--plan)
+  elif [[ "$arg" == "--regression" ]]; then
+    REGRESSION=1
   else
     ARGS+=("$arg")
   fi
 done
+
+# The nightly gate. Everything it decides - the set size, the threshold, what
+# counts as a drop - is in eval-regression, where it is tested. --n and
+# --max-f1-drop pass straight through.
+if [[ -n "${REGRESSION}" ]]; then
+  exec python -m verisearch.cli "${PLAN[@]}" eval-regression \
+    --examples "${REGRESSION_EXAMPLES}" \
+    --index "${INDEX}" \
+    --reference "${REGRESSION_REFERENCE}" \
+    --candidate "${CANDIDATE}" \
+    --dataset "${DATASET}" \
+    --split "${SPLIT}" \
+    --k "${K}" \
+    ${ARGS[@]+"${ARGS[@]}"}
+fi
 
 # Step 1. Skipped when the context already exists, because rebuilding it is how
 # two runs come to disagree about what they measured: the file is the contract,
