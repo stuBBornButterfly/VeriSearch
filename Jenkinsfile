@@ -30,7 +30,14 @@ pipeline {
         // Outer bound. Each stage has its own, tighter, timeout so that one
         // hung step cannot consume the whole budget and leave the rest of the
         // pipeline unreported.
-        timeout(time: 45, unit: 'MINUTES')
+        //
+        // At least the sum of every stage's timeout, nightly ones included;
+        // tests/test_jenkinsfile.py holds it there. It was 45 - exactly the five
+        // blocking stages - so a nightly build would have been killed partway
+        // through smoke-train and never reached eval-regression. The slack
+        // covers checkout and waiting for the GPU agent. An agent that never
+        // comes online ends the build here, which is the right signal.
+        timeout(time: 150, unit: 'MINUTES')
         // artifactNumToKeepStr matters more than the log count: coverage and
         // eval artifacts accumulate, and this controller has ~80 GB free.
         buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
@@ -151,36 +158,94 @@ pipeline {
         }
 
         // ---- nightly, main only -------------------------------------------
-        // The fileExists guards keep main green before P3 lands. They are
-        // temporary and they fail quietly by design, which is the danger: once
-        // scripts/02_train.sh and scripts/03_eval.sh exist, DELETE the
-        // fileExists lines. Until then a typo in a script path looks identical
-        // to "not written yet". Checked at P3 exit.
+        // Both nightly stages need a GPU that can train, and this controller
+        // has none (README hardware report). Each one is off until switched on
+        // in Manage Jenkins > System > Global properties:
+        //
+        //   VERISEARCH_GPU_LABEL                 label of an attached GPU agent
+        //   VERISEARCH_NIGHTLY_SMOKE_TRAIN=1     once 02_train.sh --smoke works
+        //   VERISEARCH_NIGHTLY_EVAL_REGRESSION=1 once 03_eval.sh --regression does
+        //
+        // The gate used to be fileExists('scripts/03_eval.sh'). That file
+        // arrives with the CLI PR at P1, not P3, so the first night after it
+        // merged, main would have run a regression eval on a machine with no
+        // GPU, no index and a script with no --regression mode: red main,
+        // blamed on an unrelated merge. smoke-train had the same flaw, waiting
+        // on 02_train.sh. A file existing says nothing about whether the stage
+        // can run.
+        //
+        // One switch per stage, not one for the GPU, because the two become
+        // runnable at different times. A single switch would turn
+        // eval-regression red the night smoke-train was enabled.
+        //
+        // Once a switch is on, nothing fails quietly: a missing script, an
+        // unsupported flag or an offline agent turns the build red, because by
+        // then each is a real gap rather than "not written yet".
 
-        stage('smoke-train') {
+        stage('nightly-gate') {
             when {
                 allOf {
                     branch 'main'
                     expression { isNightly() }
-                    expression { fileExists('scripts/02_train.sh') }
                 }
             }
+            options { timeout(time: 2, unit: 'MINUTES') }
+            steps {
+                // Printed every night, so a skipped stage is a line in the log
+                // and not only a grey box in the stage view.
+                script {
+                    def label = env.VERISEARCH_GPU_LABEL ?: ''
+                    def smoke = env.VERISEARCH_NIGHTLY_SMOKE_TRAIN == '1'
+                    def regression = env.VERISEARCH_NIGHTLY_EVAL_REGRESSION == '1'
+                    echo "GPU agent label  ${label ?: '(none)'}  [VERISEARCH_GPU_LABEL]"
+                    echo "smoke-train      ${smoke ? 'on' : 'off'}  [VERISEARCH_NIGHTLY_SMOKE_TRAIN]"
+                    echo "eval-regression  ${regression ? 'on' : 'off'}  [VERISEARCH_NIGHTLY_EVAL_REGRESSION]"
+                    if ((smoke || regression) && !label) {
+                        error('a nightly GPU stage is switched on but VERISEARCH_GPU_LABEL ' +
+                              'is unset, so it has no agent to run on')
+                    }
+                }
+            }
+        }
+
+        stage('smoke-train') {
+            when {
+                // Load-bearing: without it Jenkins allocates the agent before
+                // evaluating the conditions, and queues for a label that may
+                // not exist even on a night this stage is off.
+                beforeAgent true
+                allOf {
+                    branch 'main'
+                    expression { isNightly() }
+                    environment name: 'VERISEARCH_NIGHTLY_SMOKE_TRAIN', value: '1'
+                }
+            }
+            agent { label "${env.VERISEARCH_GPU_LABEL}" }
             options { timeout(time: 30, unit: 'MINUTES') }
             steps {
+                // A fresh workspace on another machine, so it installs for
+                // itself. [train] because this stage trains.
+                runCmd 'uv sync --locked --extra dev --extra train --python 3.11'
                 runCmd 'bash scripts/02_train.sh --smoke --steps 5'
             }
         }
 
         stage('eval-regression') {
             when {
+                beforeAgent true
                 allOf {
                     branch 'main'
                     expression { isNightly() }
-                    expression { fileExists('scripts/03_eval.sh') }
+                    environment name: 'VERISEARCH_NIGHTLY_EVAL_REGRESSION', value: '1'
                 }
             }
+            agent { label "${env.VERISEARCH_GPU_LABEL}" }
             options { timeout(time: 60, unit: 'MINUTES') }
             steps {
+                // [retrieval] for the index and embedder, [train] for the
+                // policy. 03_eval.sh has no --regression mode yet, which is why
+                // this stage has its own switch.
+                runCmd 'uv sync --locked --extra dev --extra retrieval --extra train --python 3.11'
                 runCmd 'bash scripts/03_eval.sh --regression --n 100 --max-f1-drop 2.0'
             }
         }
