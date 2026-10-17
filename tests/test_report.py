@@ -288,3 +288,39 @@ def test_the_serving_table_covers_the_three_required_concurrency_levels(report: 
         assert f"| {level} | " in report, f"no serving row for concurrency {level}"
     for percentile in ("p50", "p95", "p99"):
         assert f"{percentile} (ms)" in report, f"the serving table has no {percentile} column"
+
+
+def test_the_serving_table_has_the_header_the_benchmark_prints(report: str) -> None:
+    """Paste, never retype - which only works if the columns line up.
+
+    Add a column to `BenchReport.table()` and this fails until the report has
+    room for it; rename one and it fails until the report follows.
+    """
+    from verisearch.serve.benchmark import TABLE_HEADER
+
+    assert TABLE_HEADER in report, (
+        "section 8's header is not the one serve/benchmark.py prints, so its table "
+        "cannot be pasted in"
+    )
+
+
+def test_the_serving_rows_match_the_configured_levels(report: str) -> None:
+    """The rows are the levels `configs/base.yaml` actually runs, no more."""
+    from verisearch.config import load_config
+    from verisearch.serve.benchmark import TABLE_HEADER
+
+    section = report.split(TABLE_HEADER, 1)[1].split("\n\n", 1)[0]
+    rows = [line for line in section.splitlines() if line.startswith("| ") and "---" not in line]
+    levels = tuple(int(row.split("|")[1]) for row in rows)
+    assert levels == load_config().serve.concurrency_levels
+    width = TABLE_HEADER.count("|")
+    for row in rows:
+        assert row.count("|") == width, f"serving row has the wrong number of cells: {row}"
+
+
+def test_the_serving_footer_is_generated_rather_than_typed(report: str) -> None:
+    """The hardware line comes from the server's /health. A placeholder for it
+    that could be filled in by hand would undo that."""
+    assert "{{serve-hardware}}" not in report
+    assert "{{serve-model}}" not in report
+    assert "BenchReport.table" in report

@@ -64,6 +64,24 @@ eval:
   bootstrap_resamples: 1000
   confidence_level: 0.95
 
+serve:
+  # The policy server (serve/server.py) - not vLLM itself, and not retrieval.
+  # Port 8100 because retrieval holds 8000, which is also vLLM's default; run
+  # vLLM on a third port.
+  url: http://127.0.0.1:8100
+  # PROJECT.md section 9: "at concurrency 1, 8, 32".
+  concurrency_levels:
+    - 1
+    - 8
+    - 32
+  # 500 so p99 has five observations above it. See serve/benchmark.py.
+  requests_per_level: 500
+  # At least one full wave at the highest level, so no cold request is measured.
+  warmup_requests: 32
+  # Generous: one request is a whole multi-turn episode, not one completion.
+  request_timeout_s: 120
+  throughput_batches: 10
+
 logging:
   wandb_project: verisearch
   wandb_entity: null

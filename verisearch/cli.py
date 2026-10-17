@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from verisearch.config import ConfigError, load_sweep
+from verisearch.config import DEFAULT_CONFIG_PATH, ConfigError, load_config, load_sweep
 from verisearch.data.build_corpus import load_corpus, summarize_corpus
 from verisearch.data.datasets import DataError, load_jsonl
 from verisearch.eval.baselines import BaselineKind, EvalContext, EvalError, context_for
@@ -52,6 +52,8 @@ from verisearch.retrieval.index import (
     VectorIndexError,
     load_meta,
 )
+from verisearch.serve.benchmark import BenchError, HttpPolicyClient, run_benchmark, write_bench
+from verisearch.serve.server import ServeError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -67,11 +69,13 @@ CONTEXT_FILENAME = "context.json"
 # Every expected failure in this module is one of these. Anything else is a bug
 # and should reach the user as a traceback rather than a tidy message.
 _EXPECTED = (
+    BenchError,
     ConfigError,
     DataError,
     EmbedderError,
     EvalError,
     RetrievalError,
+    ServeError,
     VectorIndexError,
     OSError,
 )
@@ -343,6 +347,77 @@ def _write_figure(curve: Frontier, path: str, title: str) -> int:
     return 0  # pragma: no cover - needs the [plot] extra
 
 
+def serve_bench(args: argparse.Namespace) -> int:
+    """`scripts/05_serve_bench.sh`. Section 9's serving row, at every configured level.
+
+    Reads what it is measuring from the server's `/health` - policy, adapter,
+    hardware - so the footer under the table cannot describe a machine other
+    than the one that answered. `--plan` goes as far as that read and stops
+    before any load is sent.
+
+    Exits 1, after writing everything, when `BenchReport.problems` finds a
+    reason the table is not section 9's: a failed request, a level that never
+    reached its concurrency, or a p99 with too few requests behind it. Same
+    convention as `frontier`: the numbers are kept, the exit code refuses them.
+    """
+    examples_path = Path(args.examples)
+    try:
+        config = load_config(*args.config)
+        serve = config.serve
+        url = args.url if args.url is not None else serve.url
+        examples = load_jsonl(examples_path)
+        client, server = HttpPolicyClient.connect(url, timeout=serve.request_timeout_s)
+    except _EXPECTED as exc:
+        return _fail(str(exc))
+
+    adapter = server.adapter if server.adapter is not None else "none (base model)"
+    per_level = serve.warmup_requests + serve.requests_per_level
+    print(f"server      {url} (protocol {server.protocol_version})")
+    print(f"policy      {server.policy}, adapter {adapter}")
+    print(f"hardware    {server.hardware}")
+    print(f"config      server {server.config_fingerprint}, this run {config.fingerprint}")
+    print(f"levels      {', '.join(str(level) for level in serve.concurrency_levels)}")
+    print(
+        f"requests    {serve.requests_per_level} per level after {serve.warmup_requests} "
+        f"warmup, {per_level * len(serve.concurrency_levels)} in all"
+    )
+    print(f"questions   {len(examples)} from {examples_path}")
+
+    if args.plan:
+        print("\nplan only, no load sent, nothing written.")
+        return 0
+
+    try:
+        run = run_benchmark(
+            client,
+            server,
+            [example.question for example in examples],
+            levels=serve.concurrency_levels,
+            requests_per_level=serve.requests_per_level,
+            warmup=serve.warmup_requests,
+            request_timeout_s=serve.request_timeout_s,
+            batches=serve.throughput_batches,
+            resamples=config.eval.bootstrap_resamples,
+            confidence=config.eval.confidence_level,
+            seed=config.seed,
+        )
+    except _EXPECTED as exc:
+        return _fail(str(exc))
+
+    table = run.report.table()
+    print(f"\n{table}")
+    report_path, requests_path = write_bench(run, args.out)
+    table_path = Path(args.table)
+    table_path.parent.mkdir(parents=True, exist_ok=True)
+    table_path.write_text(table + "\n", encoding="utf-8")
+    print(f"\nwrote {report_path}\nwrote {requests_path}\nwrote {table_path}")
+
+    problems = run.report.problems()
+    for problem in problems:
+        print(f"not section 9's table - {problem}", file=sys.stderr)
+    return 1 if problems else 0
+
+
 def _add_build_index(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser("build-index", help="embed a corpus and build a vector index")
     parser.add_argument("--corpus", required=True, help="corpus JSONL from build_corpus")
@@ -405,6 +480,27 @@ def _add_frontier(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
     parser.set_defaults(handler=frontier)
 
 
+def _add_serve_bench(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser(
+        "serve-bench", help="load-benchmark the policy server at every configured concurrency"
+    )
+    parser.add_argument(
+        "--examples", required=True, help="eval set JSONL; its questions are the load"
+    )
+    parser.add_argument(
+        "--config",
+        nargs="+",
+        default=[str(DEFAULT_CONFIG_PATH)],
+        help="config YAML files, merged left to right; levels and counts come from serve:",
+    )
+    parser.add_argument("--url", default=None, help="policy server; default serve.url")
+    parser.add_argument(
+        "--out", default="results/raw/serve", help="directory for bench.json and requests.jsonl"
+    )
+    parser.add_argument("--table", default="results/tables/serving.md")
+    parser.set_defaults(handler=serve_bench)
+
+
 _DESCRIPTION = """Entry points for the scripts in scripts/. The decisions live here rather
 than in bash because mypy, ruff and pytest reach this package and do not reach
 a shell script. Pass --plan before the subcommand to resolve and print what
@@ -423,6 +519,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_eval_context(subparsers)
     _add_eval_report(subparsers)
     _add_frontier(subparsers)
+    _add_serve_bench(subparsers)
     return parser
 
 
