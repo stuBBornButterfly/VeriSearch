@@ -9,22 +9,23 @@ Two loading paths, deliberately:
   every test and every training run actually reads. Snapshots are committed as
   data, so a result can be reproduced without re-downloading anything.
 * `load_hf_dataset` - pulls from Hugging Face once, to produce those snapshots.
-  `datasets` lives in the `[train]` extra, not the core dependencies, so the
+  `datasets` lives in the `[data]` extra, not the core dependencies, so the
   import is deferred into the function. The PR pipeline never installs it and
-  must never need it.
+  must never need it. `data/prepare.py` is the command-line path that uses it.
 
-The field maps in `DATASET_SPECS` are written from the published schemas and
-**have not been checked against a live download** - no network in unit tests
-(section 3), and this machine has not fetched them yet. A wrong key raises
-`DataError` listing the keys the row actually had, so the first real download
-corrects it in one line. Verify them on the first `load_hf_dataset` call and
-drop this paragraph when they are confirmed.
+The field maps in `DATASET_SPECS` were checked against the live datasets by a
+50-row smoke build (`prepare-data --limit 50`) on 2026-10-17, which found two
+of them wrong: the 2WikiMultihopQA mirror was a loading script `datasets` 5
+will not run, and Bamboogle's rows carry no id. Both are fixed and noted at
+their specs. A full build reads every row, so a key absent only from some rows
+can still surface there; it raises `DataError` naming the keys the row had.
 
 Owner: Ayesha.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -135,13 +136,25 @@ class DatasetSpec(BaseModel):
     hf_path: str
     hf_name: str | None = None
     distribution: Distribution
-    id_key: str
+    # None when the dataset ships no id - Bamboogle does not. The id is then
+    # derived from the question text; see `row_to_example`.
+    id_key: str | None
     question_key: str
     answer_key: str
     # Optional keys. Absent from the row is fine; present but of the wrong shape
     # is an error.
     aliases_key: str | None = None
     supporting_facts_key: str | None = None
+    # The Hugging Face splits that together form this dataset's pool. Our own
+    # train/dev/test are assigned afterwards by hash (`splits.py`), so these
+    # name *what to download*, not how it is divided. Splits without public
+    # answers are left out - they cannot be scored.
+    hf_splits: tuple[str, ...] = Field(default=("train",), min_length=1)
+    # Where the row's own paragraphs are, or None when it ships none. Every
+    # dataset with a context key contributes those paragraphs to the corpus.
+    # This field is the corpus decision written as data: change it here, and
+    # the change is reviewed, not buried in a script.
+    context_key: str | None = None
 
 
 DATASET_SPECS: dict[str, DatasetSpec] = {
@@ -154,15 +167,24 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         question_key="question",
         answer_key="answer",
         supporting_facts_key="supporting_facts",
+        hf_splits=("train", "validation"),
+        context_key="context",
     ),
     "2wikimultihopqa": DatasetSpec(
         name="2wikimultihopqa",
-        hf_path="xanhho/2WikiMultihopQA",
+        # Not xanhho/2WikiMultihopQA: that mirror is a loading script, which
+        # `datasets` 5 refuses to run - found by the first live smoke build.
+        # This one is plain parquet, and its split sizes match the official
+        # release exactly (167,454 / 12,576 / 12,576). It carries no license
+        # field on the Hub; the original release is Apache-2.0.
+        hf_path="framolfese/2WikiMultihopQA",
         distribution=Distribution.IN_DISTRIBUTION,
-        id_key="_id",
+        id_key="id",
         question_key="question",
         answer_key="answer",
         supporting_facts_key="supporting_facts",
+        hf_splits=("train", "validation"),
+        context_key="context",
     ),
     "musique": DatasetSpec(
         name="musique",
@@ -172,14 +194,18 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         question_key="question",
         answer_key="answer",
         aliases_key="answer_aliases",
+        # MuSiQue's test split has no public answers.
+        hf_splits=("validation",),
     ),
     "bamboogle": DatasetSpec(
         name="bamboogle",
         hf_path="chiayewken/bamboogle",
         distribution=Distribution.OUT_OF_DISTRIBUTION,
-        id_key="id",
+        # The live rows carry only Question and Answer.
+        id_key=None,
         question_key="Question",
         answer_key="Answer",
+        hf_splits=("test",),
     ),
 }
 
@@ -250,8 +276,11 @@ def row_to_example(row: Mapping[str, object], spec: DatasetSpec) -> QAExample:
     Separated from the download so the mapping logic is unit-testable offline
     against synthetic rows. PROJECT.md section 3: no network in unit tests.
     """
-    question_id = _as_text(_require(row, spec.id_key, spec), spec.id_key, spec)
     question = _as_text(_require(row, spec.question_key, spec), spec.question_key, spec)
+    if spec.id_key is not None:
+        question_id = _as_text(_require(row, spec.id_key, spec), spec.id_key, spec)
+    else:
+        question_id = derived_id(question)
     answer = _as_text(_require(row, spec.answer_key, spec), spec.answer_key, spec)
 
     answers: list[str] = [answer] if answer else []
@@ -277,6 +306,18 @@ def row_to_example(row: Mapping[str, object], spec: DatasetSpec) -> QAExample:
     )
 
 
+def derived_id(question: str) -> str:
+    """An id for a dataset that ships none, from the question's exact text.
+
+    From the text and not the row number: splits are a function of the id, so
+    an id that moved when the file was reordered would move the example
+    between splits. Two rows with the same question get the same id, and
+    `check_unique_ids` then refuses them - which is right, since they are the
+    same question twice.
+    """
+    return "q" + hashlib.sha256(question.encode("utf-8")).hexdigest()[:12]
+
+
 def spec_for(dataset: str) -> DatasetSpec:
     """Look up a dataset spec by name, or raise listing the known names.
 
@@ -291,12 +332,12 @@ def spec_for(dataset: str) -> DatasetSpec:
     return spec
 
 
-def load_hf_dataset(  # pragma: no cover - needs the network and the [train] extra
+def load_hf_dataset(  # pragma: no cover - needs the network and the [data] extra
     dataset: str, hf_split: str = "train", limit: int | None = None
 ) -> tuple[QAExample, ...]:
     """Download one dataset from Hugging Face and map it to examples.
 
-    Not exercised in CI - it needs the network and the `[train]` extra. Use it
+    Not exercised in CI - it needs the network and the `[data]` extra. Use it
     once to produce a JSONL snapshot, commit the snapshot, and read that
     everywhere else.
 
@@ -307,9 +348,9 @@ def load_hf_dataset(  # pragma: no cover - needs the network and the [train] ext
     spec = spec_for(dataset)
     try:
         from datasets import load_dataset
-    except ImportError as exc:  # pragma: no cover - requires the [train] extra
+    except ImportError as exc:  # pragma: no cover - requires the [data] extra
         raise DataError(
-            "load_hf_dataset needs the `datasets` package: uv pip install -e '.[train]'"
+            "load_hf_dataset needs the `datasets` package: uv pip install -e '.[data]'"
         ) from exc
 
     loaded = load_dataset(spec.hf_path, spec.hf_name, split=hf_split)

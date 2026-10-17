@@ -153,7 +153,7 @@ def test_hotpotqa_row_with_parallel_list_supporting_facts() -> None:
 def test_2wiki_row_with_pairwise_supporting_facts() -> None:
     """The other published shape: a list of [title, sent_id] pairs."""
     row = {
-        "_id": "abc123",
+        "id": "abc123",
         "question": "Where was the director of Gallipoli born?",
         "answer": "Sydney",
         "supporting_facts": [["Gallipoli (1981 film)", 0], ["Peter Weir", 2]],
@@ -621,3 +621,20 @@ def test_spec_for_rejects_unknown_names_and_lists_the_known_ones(name: str) -> N
     """Case-sensitive on purpose: the keys are identifiers, not user input."""
     with pytest.raises(DataError, match=r"Known: 2wikimultihopqa, bamboogle"):
         spec_for(name)
+
+
+def test_a_derived_id_depends_on_the_text_and_nothing_else() -> None:
+    from verisearch.data.datasets import derived_id
+
+    assert derived_id("Who?") == derived_id("Who?")
+    assert derived_id("Who?") != derived_id("Who ?")
+    assert derived_id("Who?").startswith("q")
+
+
+def test_a_spec_without_an_id_key_derives_the_id() -> None:
+    from verisearch.data.datasets import derived_id
+
+    example = row_to_example(
+        {"Question": "What is the capital?", "Answer": "Austin"}, DATASET_SPECS["bamboogle"]
+    )
+    assert example.question_id == f"bamboogle-{derived_id('What is the capital?')}"

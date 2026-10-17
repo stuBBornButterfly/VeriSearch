@@ -25,6 +25,8 @@ htmlcov/
 # Project artifacts (large, regenerated, never committed)
 data/raw/
 data/processed/
+# Smoke builds (`prepare-data --limit N`). Never data, never committed.
+data/smoke/
 indexes/
 checkpoints/
 outputs/

@@ -42,6 +42,14 @@ retrieval = [
     "uvicorn>=0.30",
 ]
 
+# Downloading the datasets, once, to write data/processed/. Its own extra
+# because `datasets` was only reachable through [train], which pulls vLLM - and
+# vLLM does not install on Windows, so data preparation could not run on the
+# machine that owns it. Still never installed by the PR pipeline.
+data = [
+    "datasets>=2.20",
+]
+
 # Plotting only. Its own extra rather than [dev] because the PR pipeline
 # installs core + [dev] on every build and matplotlib is ~30 MB of wheels for
 # code CI can never exercise: `eval/frontier.py` keeps every decision in pure
