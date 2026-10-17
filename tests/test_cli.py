@@ -6,9 +6,10 @@ package rather than in the `.sh` files: a bash script that decides anything
 cannot be tested, and these decide which index a report was measured against and
 whether a sweep is complete.
 
-Four of the five commands run end to end with no optional extras installed:
-`eval-context`, `eval-report`, `frontier` and `serve-bench` - the last against
-`serve.local`'s stdlib server and a fake policy, over a real socket.
+Six of the seven commands run end to end with no optional extras installed:
+`eval-context`, `eval-report`, `frontier`, `regression-set`, `eval-regression`
+and `serve-bench` - the last against `serve.local`'s stdlib server and a fake
+policy, over a real socket.
 `build-index` is driven to the point just before the embedder loads, which is
 the only line in the module that needs torch.
 
@@ -27,12 +28,19 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from verisearch.cli import CONTEXT_FILENAME, _force_utf8, main
+from verisearch.cli import CONTEXT_FILENAME, REPORT_JSON, RESULTS_JSONL, _force_utf8, main
 from verisearch.config import DEFAULT_CONFIG_PATH
-from verisearch.data.datasets import Distribution, QAExample, Split, write_jsonl
+from verisearch.data.datasets import Distribution, QAExample, Split, load_jsonl, write_jsonl
 from verisearch.eval.baselines import BaselineKind, EvalContext, context_for
 from verisearch.eval.frontier import REPORT_FILENAME
-from verisearch.eval.harness import EvalReport, score_example, write_results
+from verisearch.eval.harness import (
+    EvalReport,
+    aggregate,
+    read_results,
+    score_example,
+    write_report,
+    write_results,
+)
 from verisearch.eval.metrics import ConfidenceInterval, FailureReason
 from verisearch.retrieval.client import RetrievalError
 from verisearch.retrieval.embedder import EmbedderSpec, l2_normalize
@@ -1095,3 +1103,181 @@ def test_serve_bench_refuses_an_unsendable_question_before_any_load(
     assert "cannot be sent" in capsys.readouterr().err
     assert runner.calls == 0
     assert not (tmp_path / "serve").exists()
+
+
+# ---------------------------------------------------------------------------
+# regression-set and eval-regression
+# ---------------------------------------------------------------------------
+
+
+def test_regression_set_writes_the_set_its_fingerprint_describes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The printed fingerprint must be the one `eval-context` then computes from
+    the written file. They are different code paths and the fingerprint is
+    order-sensitive, so this is the check that they agree."""
+    source = write_examples(tmp_path / "dev.jsonl", n=8)
+    out = tmp_path / "regression" / "examples.jsonl"
+
+    code = main(["regression-set", "--examples", str(source), "--n", "5", "--out", str(out)])
+
+    printed = capsys.readouterr().out
+    assert code == 0
+    assert len(load_jsonl(out)) == 5
+
+    index = build_real_index(tmp_path / "index")
+    context_path = tmp_path / "context.json"
+    assert (
+        main(
+            [
+                "eval-context",
+                "--index",
+                str(index),
+                "--examples",
+                str(out),
+                "--dataset",
+                "hotpotqa",
+                "--split",
+                "dev",
+                "--out",
+                str(context_path),
+            ]
+        )
+        == 0
+    )
+    context = EvalContext.model_validate_json(context_path.read_text(encoding="utf-8"))
+    assert f"fingerprint={context.examples_fingerprint}" in printed
+
+
+def test_regression_set_refuses_to_replace_the_set_a_reference_was_scored_on(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = write_examples(tmp_path / "dev.jsonl", n=8)
+    out = tmp_path / "examples.jsonl"
+    argv = ["regression-set", "--examples", str(source), "--n", "5", "--out", str(out)]
+    assert main(argv) == 0
+    capsys.readouterr()
+
+    assert main(argv) == 2
+    assert "already exists" in capsys.readouterr().err
+    assert main([*argv, "--force"]) == 0
+
+
+def test_regression_set_plan_writes_nothing(tmp_path: Path) -> None:
+    source = write_examples(tmp_path / "dev.jsonl", n=8)
+    out = tmp_path / "examples.jsonl"
+    argv = ["--plan", "regression-set", "--examples", str(source), "--n", "5", "--out", str(out)]
+    assert main(argv) == 0
+    assert not out.exists()
+
+
+def test_regression_set_from_too_small_a_pool_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = write_examples(tmp_path / "dev.jsonl", n=3)
+    code = main(
+        ["regression-set", "--examples", str(source), "--n", "5", "--out", str(tmp_path / "x")]
+    )
+    assert code == 2
+    assert "found 3" in capsys.readouterr().err
+
+
+def make_reference(
+    directory: Path, *, n: int = 3, correct: int = 3, spec: EmbedderSpec = SPEC
+) -> Path:
+    """A promoted reference: report.json and results.jsonl, as 03_eval.sh writes them."""
+    directory.mkdir(parents=True, exist_ok=True)
+    results = make_results_file(directory / RESULTS_JSONL, n, correct=correct)
+    context = context_for(
+        [f"q{i}" for i in range(n)],
+        dataset="hotpotqa",
+        split="dev",
+        retriever_fingerprint=spec.fingerprint,
+        k=3,
+    )
+    report = aggregate(
+        read_results(results),
+        run_name="reference",
+        kind=BaselineKind.TRAINED,
+        context=context,
+        resamples=100,
+    )
+    write_report(report, directory / REPORT_JSON)
+    return directory
+
+
+def regression_argv(tmp_path: Path, *, candidate_correct: int, n: int = 3) -> list[str]:
+    candidate = make_results_file(tmp_path / "candidate.jsonl", 3, correct=candidate_correct)
+    return [
+        "eval-regression",
+        "--examples",
+        str(write_examples(tmp_path / "regression.jsonl", n=3)),
+        "--index",
+        str(build_real_index(tmp_path / "index")),
+        "--reference",
+        str(tmp_path / "reference"),
+        "--candidate",
+        str(candidate),
+        "--dataset",
+        "hotpotqa",
+        "--split",
+        "dev",
+        "--n",
+        str(n),
+        "--max-f1-drop",
+        "2.0",
+        "--resamples",
+        "100",
+    ]
+
+
+def test_eval_regression_passes_when_f1_held(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    make_reference(tmp_path / "reference", correct=3)
+    code = main(regression_argv(tmp_path, candidate_correct=3))
+    assert code == 0
+    assert "verdict             held" in capsys.readouterr().out
+
+
+def test_eval_regression_fails_when_f1_fell_and_the_interval_agrees(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every question that was right is now wrong: the interval is [-1, -1]."""
+    make_reference(tmp_path / "reference", correct=3)
+    code = main(regression_argv(tmp_path, candidate_correct=0))
+    out = capsys.readouterr()
+    assert code == 1
+    assert "REGRESSED" in out.err
+    assert "verdict             regressed" in out.out
+
+
+def test_eval_regression_refuses_a_set_of_the_wrong_size(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--n is the gate's definition. A different file is a different gate."""
+    make_reference(tmp_path / "reference")
+    code = main(regression_argv(tmp_path, candidate_correct=3, n=100))
+    assert code == 2
+    assert "not the 100 this gate is defined on" in capsys.readouterr().err
+
+
+def test_eval_regression_without_a_reference_cannot_pass(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A comparison that could not be made is never a pass."""
+    code = main(regression_argv(tmp_path, candidate_correct=3))
+    assert code == 2
+    assert "no report at" in capsys.readouterr().err
+
+
+def test_eval_regression_refuses_a_reference_from_another_index(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The candidate's context comes from tonight's index, not the reference's
+    file - so a reference scored against a different index is caught."""
+    other = EmbedderSpec(model_name="another-embedder", dim=4, normalize=True)
+    make_reference(tmp_path / "reference", spec=other)
+    code = main(regression_argv(tmp_path, candidate_correct=3))
+    assert code == 2
+    assert "retriever_fingerprint" in capsys.readouterr().err
