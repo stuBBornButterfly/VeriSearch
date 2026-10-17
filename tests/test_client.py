@@ -333,14 +333,27 @@ def test_a_hit_the_store_cannot_resolve_is_an_error_not_a_short_result() -> None
 
 
 class CountingRetriever:
-    """Records every call so the cache's effect is observable."""
+    """Records every call so the cache's effect is observable.
+
+    `batches` is separate from `calls` on purpose: the point of the caching
+    layer's `search_batch` is that N queries cost one inner round trip, and that
+    is only observable if batch calls are counted as batches.
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
+        self.batches: list[tuple[tuple[str, ...], int]] = []
 
     def search(self, query: str, k: int) -> list[Passage]:
         self.calls.append((query, k))
         return [Passage(doc_id=f"{query}-{k}", title="T", text="Body.", score=1.0)]
+
+    def search_batch(self, queries: Sequence[str], k: int) -> list[list[Passage]]:
+        self.batches.append((tuple(queries), k))
+        return [
+            [Passage(doc_id=f"{query}-{k}", title="T", text="Body.", score=1.0)]
+            for query in queries
+        ]
 
 
 def test_a_repeated_query_is_served_from_memory() -> None:
@@ -449,3 +462,133 @@ def test_an_index_hit_carries_no_text_so_the_join_is_the_only_source() -> None:
     hit = IndexHit(doc_id="d1", score=0.5, row=0)
     assert not hasattr(hit, "text")
     assert not hasattr(hit, "title")
+
+
+# ---------------------------------------------------------------------------
+# CachingRetriever.search_batch - the method the protocol change enables
+# ---------------------------------------------------------------------------
+
+
+def test_a_batch_of_misses_costs_one_inner_round_trip() -> None:
+    """This is why `search_batch` belongs on the shared protocol.
+
+    Before it, `CachingRetriever` held a `Retriever` with no batch method, so
+    the cache could only ever loop - one round trip per distinct query, against
+    an HTTP service, inside the rollout loop.
+    """
+    inner = CountingRetriever()
+    cached = CachingRetriever(inner)
+
+    results = cached.search_batch(["a", "b", "c"], 2)
+
+    assert [p[0].doc_id for p in results] == ["a-2", "b-2", "c-2"]
+    assert inner.batches == [(("a", "b", "c"), 2)]
+    assert inner.calls == []
+    assert cached.misses == 3
+    assert cached.hits == 0
+
+
+def test_a_batch_served_entirely_from_memory_never_touches_the_inner() -> None:
+    inner = CountingRetriever()
+    cached = CachingRetriever(inner)
+    cached.search_batch(["a", "b"], 2)
+    inner.batches.clear()
+
+    results = cached.search_batch(["b", "a"], 2)
+
+    assert [p[0].doc_id for p in results] == ["b-2", "a-2"]
+    assert inner.batches == []
+    assert cached.hits == 2
+
+
+def test_a_mixed_batch_fetches_only_the_misses_and_keeps_order() -> None:
+    inner = CountingRetriever()
+    cached = CachingRetriever(inner)
+    cached.search("b", 2)  # warm one entry; this is itself a miss
+    inner.calls.clear()
+    before = cached.misses
+
+    results = cached.search_batch(["a", "b", "c"], 2)
+
+    assert [p[0].doc_id for p in results] == ["a-2", "b-2", "c-2"]
+    assert inner.batches == [(("a", "c"), 2)]
+    assert cached.hits == 1
+    assert cached.misses - before == 2
+
+
+def test_a_query_repeated_inside_one_batch_is_fetched_once() -> None:
+    """The GRPO case exactly: eight rollouts, one prompt, the same opening query.
+
+    A loop over `search` would serve seven of those from memory only because the
+    first had already returned - inside a single batch there is nothing cached
+    yet, so without de-duplication this is eight identical lookups.
+    """
+    inner = CountingRetriever()
+    cached = CachingRetriever(inner)
+
+    results = cached.search_batch(["a"] * 8, 3)
+
+    assert inner.batches == [(("a",), 3)]
+    assert [p[0].doc_id for p in results] == ["a-3"] * 8
+
+
+def test_batch_results_are_separate_lists() -> None:
+    """A de-duplicated query must not hand the same list to two positions."""
+    cached = CachingRetriever(CountingRetriever())
+    first, second = cached.search_batch(["a", "a"], 1)
+    first.clear()
+    assert len(second) == 1
+
+
+def test_a_batch_respects_the_cache_bound() -> None:
+    inner = CountingRetriever()
+    cached = CachingRetriever(inner, max_entries=2)
+
+    cached.search_batch(["a", "b", "c"], 1)
+
+    assert cached.size == 2
+    assert [p[0].doc_id for p in cached.search_batch(["c"], 1)] == ["c-1"]
+    assert cached.hits == 1
+
+
+def test_a_batch_error_is_not_cached() -> None:
+    """Same contract as `search`: one transient failure must not become permanent."""
+
+    class FlakyBatch:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def search(self, query: str, k: int) -> list[Passage]:
+            raise AssertionError("search_batch must not fall back to search")
+
+        def search_batch(self, queries: Sequence[str], k: int) -> list[list[Passage]]:
+            self.calls += 1
+            if self.calls == 1:
+                raise RetrievalError("transient")
+            return [[Passage(doc_id="d1", title="T", text="Body.")] for _ in queries]
+
+    inner = FlakyBatch()
+    cached = CachingRetriever(inner)
+    with pytest.raises(RetrievalError, match="transient"):
+        cached.search_batch(["q"], 1)
+    assert cached.size == 0
+    assert len(cached.search_batch(["q"], 1)[0]) == 1
+    assert inner.calls == 2
+
+
+@pytest.mark.parametrize(
+    ("queries", "k", "message"),
+    [
+        pytest.param(["a"], 0, "k must be positive", id="zero-k"),
+        pytest.param(["a"], -1, "k must be positive", id="negative-k"),
+        pytest.param([], 1, "at least one query", id="no-queries"),
+    ],
+)
+def test_the_cache_refuses_the_same_bad_input_the_real_retriever_does(
+    queries: list[str], k: int, message: str
+) -> None:
+    """A wrapper that validated less than what it wraps would hide caller bugs
+    until they reached the live service."""
+    cached = CachingRetriever(CountingRetriever())
+    with pytest.raises(RetrievalError, match=message):
+        cached.search_batch(queries, k)

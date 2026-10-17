@@ -617,3 +617,20 @@ def test_health_over_the_wire_reports_what_is_being_served(
     assert isinstance(health, HealthResponse)
     assert health.embedder_fingerprint == SPEC.fingerprint
     assert health.protocol_version == SERVICE_PROTOCOL_VERSION
+
+
+def test_any_retriever_satisfies_the_services_batch_protocol() -> None:
+    """Keeps `batch_witness` from being dead code, and states the claim.
+
+    The service declares its own `BatchRetriever` rather than importing
+    `types.Retriever`, because "what the project agreed" and "what this service
+    calls" are different statements that happen to coincide. `batch_witness` is
+    what fails, under mypy, on the day they stop coinciding.
+    """
+    from verisearch.retrieval.service import batch_witness
+    from verisearch.testing.fakes import FakeRetriever
+
+    retriever = FakeRetriever()
+    witnessed = batch_witness(retriever)
+    assert witnessed is retriever
+    assert witnessed.search_batch(["Ada Lovelace"], 1)

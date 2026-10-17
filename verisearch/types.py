@@ -324,19 +324,24 @@ class Retriever(Protocol):
 
     def search(self, query: str, k: int) -> list[Passage]: ...
 
-    # DECIDE - the throughput question. GRPO generates a group of 8 rollouts at
-    # once, so 8 searches arrive together, and the real retriever is an HTTP
-    # service. A sync single-query protocol serializes all 8 behind one socket.
+    # DECIDED on #2: option (b), now rather than at P3.
     #
-    #   a) leave it sync and single. Simplest, and rollout throughput may not be
-    #      retrieval-bound at group 8. Measure before deciding.
-    #   b) add `search_batch(queries: list[str], k: int) -> list[list[Passage]]`
-    #      as a second method. Batches the hot path, keeps fakes trivial.
-    #   c) go async. Correct, and it infects the whole training loop including
-    #      the vLLM calls.
+    # The throughput question was whether a sync single-query protocol
+    # serialises a GRPO group behind one socket. It does: the rollout loop makes
+    # one `generate()` call per turn across all live rollouts, so up to
+    # `group_size` queries are in hand at once, and the real retriever is an
+    # HTTP service.
     #
-    # Proposing (a) now, (b) at P3 if profiling says retrieval is the
-    # bottleneck, (c) only with evidence. Dhrubo owns the measurement.
+    # Taken now because the cost is asymmetric. Today it is one method on the
+    # fakes - `LocalRetriever` and `HttpRetriever` already implement it and the
+    # service already has `handle_batch_search`, so the capability existed and
+    # only the shared contract was missing it. At P3 the same change rewrites
+    # the hot loop and every fake, during the phase where the training curve is
+    # the thing being debugged.
+    #
+    # Option (c), async, still needs evidence. It infects the whole training
+    # loop including the vLLM calls, and batching is the cheaper half of it.
+    def search_batch(self, queries: Sequence[str], k: int) -> list[list[Passage]]: ...
 
 
 class FaithfulnessScorer(Protocol):
