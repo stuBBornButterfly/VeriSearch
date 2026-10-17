@@ -164,7 +164,7 @@ pipeline {
         //
         //   VERISEARCH_GPU_LABEL                 label of an attached GPU agent
         //   VERISEARCH_NIGHTLY_SMOKE_TRAIN=1     once 02_train.sh --smoke works
-        //   VERISEARCH_NIGHTLY_EVAL_REGRESSION=1 once 03_eval.sh --regression does
+        //   VERISEARCH_NIGHTLY_EVAL_REGRESSION=1 once a nightly candidate run exists
         //
         // The gate used to be fileExists('scripts/03_eval.sh'). That file
         // arrives with the CLI PR at P1, not P3, so the first night after it
@@ -243,8 +243,10 @@ pipeline {
             options { timeout(time: 60, unit: 'MINUTES') }
             steps {
                 // [retrieval] for the index and embedder, [train] for the
-                // policy. 03_eval.sh has no --regression mode yet, which is why
-                // this stage has its own switch.
+                // policy. --regression compares tonight's rows on the fixed set
+                // with a promoted reference, so a step that runs the policy on
+                // that set has to come first - and that needs the episode loop,
+                // which is why this stage has its own switch.
                 runCmd 'uv sync --locked --extra dev --extra retrieval --extra train --python 3.11'
                 runCmd 'bash scripts/03_eval.sh --regression --n 100 --max-f1-drop 2.0'
             }
