@@ -33,6 +33,11 @@ results/raw/*
 !results/raw/.gitkeep
 results/figures/*
 !results/figures/.gitkeep
+# ...except the one figure writeup/report.md embeds. Section 2 requires the
+# report to be published with its plots, and a figure that is gitignored renders
+# for its author and nobody else. The table behind it is results/frontier.md,
+# which is not under an ignored path.
+!results/figures/frontier.png
 
 # Model weights
 *.bin
