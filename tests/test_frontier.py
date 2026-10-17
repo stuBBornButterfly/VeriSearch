@@ -415,7 +415,7 @@ def test_an_incomplete_sweep_names_the_lambda_that_is_missing(tmp_path: Path) ->
     _, reports = sweep_reports(EXPECTED_F1, EXPECTED_SEARCHES)
     spec = write_sweep(tmp_path, reports, skip=2)
 
-    with pytest.raises(EvalError, match=r"λ=0\.05") as caught:
+    with pytest.raises(EvalError, match=r"lambda=0\.05") as caught:
         load_sweep_results(spec, root=tmp_path)
     assert "looks exactly like a complete one" in str(caught.value)
 
