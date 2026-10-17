@@ -61,7 +61,7 @@ def hotpot_row(
 
 def wiki_row(index: int) -> dict[str, object]:
     return {
-        "_id": f"w{index}",
+        "id": f"w{index}",
         "question": f"Wiki question {index}?",
         "answer": "no",
         "supporting_facts": [[f"Wiki gold {index}", 0]],
@@ -79,7 +79,8 @@ def musique_row(index: int) -> dict[str, object]:
 
 
 def bamboogle_row(index: int) -> dict[str, object]:
-    return {"id": f"b{index}", "Question": f"Bamboogle {index}?", "Answer": "y"}
+    # The live rows carry no id at all.
+    return {"Question": f"Bamboogle {index}?", "Answer": "y"}
 
 
 def once(rows: list[dict[str, object]]) -> Iterator[Mapping[str, object]]:
@@ -350,3 +351,22 @@ def test_an_interrupted_build_leaves_no_manifest(
     with pytest.raises(OSError, match="disk full"):
         write_prepared(assemble(parts(), seed=42, built_at=STAMP), out)
     assert not (out / MANIFEST_FILENAME).exists()
+
+
+def test_a_dataset_without_ids_gets_stable_ones_from_the_question() -> None:
+    """Bamboogle ships Question and Answer only. The id comes from the text, so
+    a reordered file keeps every example in the same split."""
+    rows = [bamboogle_row(i) for i in range(4)]
+    forward = read_dataset(once(rows), BAMBOOGLE).examples
+    backward = read_dataset(once(list(reversed(rows))), BAMBOOGLE).examples
+    assert sorted(e.question_id for e in forward) == sorted(e.question_id for e in backward)
+    assert all(e.question_id.startswith("bamboogle-q") for e in forward)
+
+
+def test_the_same_question_twice_without_ids_is_refused() -> None:
+    """Same text, same derived id - and two copies of one question are a
+    duplicate, not two examples."""
+    rows = [bamboogle_row(0), bamboogle_row(0)]
+    part = read_dataset(once(rows), BAMBOOGLE)
+    with pytest.raises(DataError, match="duplicate question_id"):
+        assemble([read_dataset(once([hotpot_row(0)]), HOTPOT), part], seed=42)

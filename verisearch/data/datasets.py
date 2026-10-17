@@ -13,18 +13,19 @@ Two loading paths, deliberately:
   import is deferred into the function. The PR pipeline never installs it and
   must never need it. `data/prepare.py` is the command-line path that uses it.
 
-The field maps in `DATASET_SPECS` are written from the published schemas and
-**have not been checked against a live download** - no network in unit tests
-(section 3), and this machine has not fetched them yet. A wrong key raises
-`DataError` listing the keys the row actually had, so the first real download
-corrects it in one line. Verify them on the first `load_hf_dataset` call and
-drop this paragraph when they are confirmed.
+The field maps in `DATASET_SPECS` were checked against the live datasets by a
+50-row smoke build (`prepare-data --limit 50`) on 2026-10-17, which found two
+of them wrong: the 2WikiMultihopQA mirror was a loading script `datasets` 5
+will not run, and Bamboogle's rows carry no id. Both are fixed and noted at
+their specs. A full build reads every row, so a key absent only from some rows
+can still surface there; it raises `DataError` naming the keys the row had.
 
 Owner: Ayesha.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -135,7 +136,9 @@ class DatasetSpec(BaseModel):
     hf_path: str
     hf_name: str | None = None
     distribution: Distribution
-    id_key: str
+    # None when the dataset ships no id - Bamboogle does not. The id is then
+    # derived from the question text; see `row_to_example`.
+    id_key: str | None
     question_key: str
     answer_key: str
     # Optional keys. Absent from the row is fine; present but of the wrong shape
@@ -169,9 +172,14 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
     ),
     "2wikimultihopqa": DatasetSpec(
         name="2wikimultihopqa",
-        hf_path="xanhho/2WikiMultihopQA",
+        # Not xanhho/2WikiMultihopQA: that mirror is a loading script, which
+        # `datasets` 5 refuses to run - found by the first live smoke build.
+        # This one is plain parquet, and its split sizes match the official
+        # release exactly (167,454 / 12,576 / 12,576). It carries no license
+        # field on the Hub; the original release is Apache-2.0.
+        hf_path="framolfese/2WikiMultihopQA",
         distribution=Distribution.IN_DISTRIBUTION,
-        id_key="_id",
+        id_key="id",
         question_key="question",
         answer_key="answer",
         supporting_facts_key="supporting_facts",
@@ -193,7 +201,8 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         name="bamboogle",
         hf_path="chiayewken/bamboogle",
         distribution=Distribution.OUT_OF_DISTRIBUTION,
-        id_key="id",
+        # The live rows carry only Question and Answer.
+        id_key=None,
         question_key="Question",
         answer_key="Answer",
         hf_splits=("test",),
@@ -267,8 +276,11 @@ def row_to_example(row: Mapping[str, object], spec: DatasetSpec) -> QAExample:
     Separated from the download so the mapping logic is unit-testable offline
     against synthetic rows. PROJECT.md section 3: no network in unit tests.
     """
-    question_id = _as_text(_require(row, spec.id_key, spec), spec.id_key, spec)
     question = _as_text(_require(row, spec.question_key, spec), spec.question_key, spec)
+    if spec.id_key is not None:
+        question_id = _as_text(_require(row, spec.id_key, spec), spec.id_key, spec)
+    else:
+        question_id = derived_id(question)
     answer = _as_text(_require(row, spec.answer_key, spec), spec.answer_key, spec)
 
     answers: list[str] = [answer] if answer else []
@@ -292,6 +304,18 @@ def row_to_example(row: Mapping[str, object], spec: DatasetSpec) -> QAExample:
         supporting_titles=titles,
         split=Split.OOD if spec.distribution is Distribution.OUT_OF_DISTRIBUTION else None,
     )
+
+
+def derived_id(question: str) -> str:
+    """An id for a dataset that ships none, from the question's exact text.
+
+    From the text and not the row number: splits are a function of the id, so
+    an id that moved when the file was reordered would move the example
+    between splits. Two rows with the same question get the same id, and
+    `check_unique_ids` then refuses them - which is right, since they are the
+    same question twice.
+    """
+    return "q" + hashlib.sha256(question.encode("utf-8")).hexdigest()[:12]
 
 
 def spec_for(dataset: str) -> DatasetSpec:

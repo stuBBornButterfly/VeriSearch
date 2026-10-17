@@ -1311,7 +1311,7 @@ def fixture_rows(spec: DatasetSpec, limit: int | None = None) -> Iterator[dict[s
             }
         elif spec.name == "2wikimultihopqa":
             yield {
-                "_id": f"w{i}",
+                "id": f"w{i}",
                 "question": f"Wiki {i}?",
                 "answer": "yes",
                 "supporting_facts": [["Wiki gold", 0]],
@@ -1320,7 +1320,7 @@ def fixture_rows(spec: DatasetSpec, limit: int | None = None) -> Iterator[dict[s
         elif spec.name == "musique":
             yield {"id": f"m{i}", "question": f"Musique {i}?", "answer": "x"}
         else:
-            yield {"id": f"b{i}", "Question": f"Bamboogle {i}?", "Answer": "y"}
+            yield {"Question": f"Bamboogle {i}?", "Answer": "y"}
 
 
 @pytest.fixture

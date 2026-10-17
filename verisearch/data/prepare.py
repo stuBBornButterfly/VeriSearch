@@ -359,9 +359,8 @@ def download_rows(  # pragma: no cover - needs the network and the [data] extra
 ) -> Iterator[Mapping[str, object]]:
     """Every row of every split in `spec.hf_splits`, lazily, `limit` per split.
 
-    Not exercised in CI, and **not yet run against the live datasets**: the
-    field maps and split names in `DATASET_SPECS` are from the published
-    schemas. A smoke build (`--limit 50`) is the check.
+    Not exercised in CI. Run against the live datasets by a 50-row smoke build
+    on 2026-10-17; a full build has not run yet.
 
     Lazy because HotpotQA's training split with its contexts is gigabytes as
     Python objects; `read_dataset` consumes each row once and keeps only what it
@@ -376,9 +375,21 @@ def download_rows(  # pragma: no cover - needs the network and the [data] extra
     for hf_split in spec.hf_splits:
         # Streaming when limited, so a smoke build fetches a few rows rather
         # than the whole split. A full build downloads and caches normally.
-        loaded = load_dataset(
-            spec.hf_path, spec.hf_name, split=hf_split, streaming=limit is not None
-        )
+        try:
+            loaded = load_dataset(
+                spec.hf_path, spec.hf_name, split=hf_split, streaming=limit is not None
+            )
+        except Exception as exc:
+            # Broad on purpose, and only around this one call. `datasets` says
+            # "this source cannot be read" with a dozen unrelated types - a
+            # RuntimeError for a script-based mirror, a ValueError for an
+            # unknown split, its own DatasetNotFoundError, ConnectionError -
+            # and to this command they all mean one thing. Translated, not
+            # swallowed: the type and message travel with it.
+            raise DataError(
+                f"{spec.name}: cannot load {spec.hf_path} split {hf_split!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         for index, row in enumerate(loaded):
             if limit is not None and index >= limit:
                 break
