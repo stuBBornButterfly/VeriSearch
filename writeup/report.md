@@ -463,8 +463,9 @@ is checkable after the fact.
 ## 12. Reproduction
 
 ```bash
-uv pip install -e '.[dev,retrieval,plot]'
+uv pip install -e '.[dev,data,retrieval,plot]'
 
+scripts/00_prepare_data.sh            # downloads, splits, builds corpus.jsonl
 scripts/01_build_index.sh --plan      # prints the fingerprint, writes nothing
 scripts/01_build_index.sh
 

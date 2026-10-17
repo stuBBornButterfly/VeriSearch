@@ -9,9 +9,9 @@ Two loading paths, deliberately:
   every test and every training run actually reads. Snapshots are committed as
   data, so a result can be reproduced without re-downloading anything.
 * `load_hf_dataset` - pulls from Hugging Face once, to produce those snapshots.
-  `datasets` lives in the `[train]` extra, not the core dependencies, so the
+  `datasets` lives in the `[data]` extra, not the core dependencies, so the
   import is deferred into the function. The PR pipeline never installs it and
-  must never need it.
+  must never need it. `data/prepare.py` is the command-line path that uses it.
 
 The field maps in `DATASET_SPECS` are written from the published schemas and
 **have not been checked against a live download** - no network in unit tests
@@ -142,6 +142,16 @@ class DatasetSpec(BaseModel):
     # is an error.
     aliases_key: str | None = None
     supporting_facts_key: str | None = None
+    # The Hugging Face splits that together form this dataset's pool. Our own
+    # train/dev/test are assigned afterwards by hash (`splits.py`), so these
+    # name *what to download*, not how it is divided. Splits without public
+    # answers are left out - they cannot be scored.
+    hf_splits: tuple[str, ...] = Field(default=("train",), min_length=1)
+    # Where the row's own paragraphs are, or None when it ships none. Every
+    # dataset with a context key contributes those paragraphs to the corpus.
+    # This field is the corpus decision written as data: change it here, and
+    # the change is reviewed, not buried in a script.
+    context_key: str | None = None
 
 
 DATASET_SPECS: dict[str, DatasetSpec] = {
@@ -154,6 +164,8 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         question_key="question",
         answer_key="answer",
         supporting_facts_key="supporting_facts",
+        hf_splits=("train", "validation"),
+        context_key="context",
     ),
     "2wikimultihopqa": DatasetSpec(
         name="2wikimultihopqa",
@@ -163,6 +175,8 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         question_key="question",
         answer_key="answer",
         supporting_facts_key="supporting_facts",
+        hf_splits=("train", "validation"),
+        context_key="context",
     ),
     "musique": DatasetSpec(
         name="musique",
@@ -172,6 +186,8 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         question_key="question",
         answer_key="answer",
         aliases_key="answer_aliases",
+        # MuSiQue's test split has no public answers.
+        hf_splits=("validation",),
     ),
     "bamboogle": DatasetSpec(
         name="bamboogle",
@@ -180,6 +196,7 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         id_key="id",
         question_key="Question",
         answer_key="Answer",
+        hf_splits=("test",),
     ),
 }
 
@@ -291,12 +308,12 @@ def spec_for(dataset: str) -> DatasetSpec:
     return spec
 
 
-def load_hf_dataset(  # pragma: no cover - needs the network and the [train] extra
+def load_hf_dataset(  # pragma: no cover - needs the network and the [data] extra
     dataset: str, hf_split: str = "train", limit: int | None = None
 ) -> tuple[QAExample, ...]:
     """Download one dataset from Hugging Face and map it to examples.
 
-    Not exercised in CI - it needs the network and the `[train]` extra. Use it
+    Not exercised in CI - it needs the network and the `[data]` extra. Use it
     once to produce a JSONL snapshot, commit the snapshot, and read that
     everywhere else.
 
@@ -307,9 +324,9 @@ def load_hf_dataset(  # pragma: no cover - needs the network and the [train] ext
     spec = spec_for(dataset)
     try:
         from datasets import load_dataset
-    except ImportError as exc:  # pragma: no cover - requires the [train] extra
+    except ImportError as exc:  # pragma: no cover - requires the [data] extra
         raise DataError(
-            "load_hf_dataset needs the `datasets` package: uv pip install -e '.[train]'"
+            "load_hf_dataset needs the `datasets` package: uv pip install -e '.[data]'"
         ) from exc
 
     loaded = load_dataset(spec.hf_path, spec.hf_name, split=hf_split)

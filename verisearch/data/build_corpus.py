@@ -334,7 +334,7 @@ def load_corpus(path: str | Path) -> tuple[CorpusDoc, ...]:
     return tuple(docs)
 
 
-def build_corpus_from_hf(  # pragma: no cover - needs the network and the [train] extra
+def build_corpus_from_hf(  # pragma: no cover - needs the network and the [data] extra
     dataset: str = "hotpotqa",
     hf_split: str = "train",
     limit: int | None = None,
@@ -343,7 +343,7 @@ def build_corpus_from_hf(  # pragma: no cover - needs the network and the [train
 ) -> CorpusBuild:
     """Download one dataset and build the corpus from its context paragraphs.
 
-    Not exercised in CI - needs the network and the `[train]` extra. Run it once,
+    Not exercised in CI - needs the network and the `[data]` extra. Run it once,
     write the result with `write_corpus`, and read that file everywhere else.
 
     Excluded from coverage as a whole rather than line by line: every statement
@@ -353,9 +353,9 @@ def build_corpus_from_hf(  # pragma: no cover - needs the network and the [train
     spec = spec_for(dataset)
     try:
         from datasets import load_dataset
-    except ImportError as exc:  # pragma: no cover - requires the [train] extra
+    except ImportError as exc:  # pragma: no cover - requires the [data] extra
         raise DataError(
-            "build_corpus_from_hf needs the `datasets` package: uv pip install -e '.[train]'"
+            "build_corpus_from_hf needs the `datasets` package: uv pip install -e '.[data]'"
         ) from exc
 
     loaded = load_dataset(spec.hf_path, spec.hf_name, split=hf_split)

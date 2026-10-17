@@ -6548,6 +6548,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+data = [
+    { name = "datasets" },
+]
 dev = [
     { name = "mypy" },
     { name = "pytest" },
@@ -6579,6 +6582,7 @@ train = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'train'", specifier = ">=0.31" },
+    { name = "datasets", marker = "extra == 'data'", specifier = ">=2.20" },
     { name = "datasets", marker = "extra == 'train'", specifier = ">=2.20" },
     { name = "faiss-cpu", marker = "extra == 'retrieval'", specifier = ">=1.8" },
     { name = "fastapi", marker = "extra == 'retrieval'", specifier = ">=0.111" },
@@ -6602,7 +6606,7 @@ requires-dist = [
     { name = "vllm", marker = "extra == 'train'", specifier = ">=0.5" },
     { name = "wandb", marker = "extra == 'train'", specifier = ">=0.17" },
 ]
-provides-extras = ["dev", "retrieval", "plot", "train"]
+provides-extras = ["dev", "retrieval", "data", "plot", "train"]
 
 [[package]]
 name = "vllm"

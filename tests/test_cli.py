@@ -6,9 +6,10 @@ package rather than in the `.sh` files: a bash script that decides anything
 cannot be tested, and these decide which index a report was measured against and
 whether a sweep is complete.
 
-Six of the seven commands run end to end with no optional extras installed:
-`eval-context`, `eval-report`, `frontier`, `regression-set`, `eval-regression`
-and `serve-bench` - the last against `serve.local`'s stdlib server and a fake
+Seven of the eight commands run end to end with no optional extras installed:
+`prepare-data` (with the download replaced by fixture rows), `eval-context`,
+`eval-report`, `frontier`, `regression-set`, `eval-regression` and
+`serve-bench` - the last against `serve.local`'s stdlib server and a fake
 policy, over a real socket.
 `build-index` is driven to the point just before the embedder loads, which is
 the only line in the module that needs torch.
@@ -30,7 +31,14 @@ import pytest
 
 from verisearch.cli import CONTEXT_FILENAME, REPORT_JSON, RESULTS_JSONL, _force_utf8, main
 from verisearch.config import DEFAULT_CONFIG_PATH
-from verisearch.data.datasets import Distribution, QAExample, Split, load_jsonl, write_jsonl
+from verisearch.data.datasets import (
+    DatasetSpec,
+    Distribution,
+    QAExample,
+    Split,
+    load_jsonl,
+    write_jsonl,
+)
 from verisearch.eval.baselines import BaselineKind, EvalContext, context_for
 from verisearch.eval.frontier import REPORT_FILENAME
 from verisearch.eval.harness import (
@@ -52,6 +60,7 @@ from verisearch.serve.server import handle_health
 from verisearch.types import Passage, Termination, Trajectory, Turn, TurnKind
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 SPEC = EmbedderSpec(model_name="cli-test", dim=4, normalize=True)
@@ -1281,3 +1290,175 @@ def test_eval_regression_refuses_a_reference_from_another_index(
     code = main(regression_argv(tmp_path, candidate_correct=3))
     assert code == 2
     assert "retriever_fingerprint" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# prepare-data
+# ---------------------------------------------------------------------------
+
+
+def fixture_rows(spec: DatasetSpec, limit: int | None = None) -> Iterator[dict[str, object]]:
+    """Stands in for `download_rows`: a handful of rows in each dataset's shape."""
+    n = 12 if limit is None else min(limit, 12)
+    for i in range(n):
+        if spec.name == "hotpotqa":
+            yield {
+                "id": f"h{i}",
+                "question": f"Hotpot {i}?",
+                "answer": "Ada Lovelace",
+                "supporting_facts": {"title": ["Ada"], "sent_id": [0]},
+                "context": {"title": ["Ada", f"Other {i}"], "sentences": [["Ada."], ["No."]]},
+            }
+        elif spec.name == "2wikimultihopqa":
+            yield {
+                "_id": f"w{i}",
+                "question": f"Wiki {i}?",
+                "answer": "yes",
+                "supporting_facts": [["Wiki gold", 0]],
+                "context": [["Wiki gold", ["Yes."]]],
+            }
+        elif spec.name == "musique":
+            yield {"id": f"m{i}", "question": f"Musique {i}?", "answer": "x"}
+        else:
+            yield {"id": f"b{i}", "Question": f"Bamboogle {i}?", "Answer": "y"}
+
+
+@pytest.fixture
+def offline(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace the download with fixture rows, and record what was fetched."""
+    fetched: list[str] = []
+
+    def fake(spec: DatasetSpec, limit: int | None = None) -> Iterator[dict[str, object]]:
+        fetched.append(spec.name)
+        return fixture_rows(spec, limit)
+
+    monkeypatch.setattr("verisearch.cli.download_rows", fake)
+    return fetched
+
+
+def test_prepare_data_writes_what_the_index_and_eval_scripts_read(
+    tmp_path: Path, offline: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The point of the command: the two default paths downstream exist after it."""
+    out = tmp_path / "processed"
+    code = main(["prepare-data", "--out", str(out)])
+
+    printed = capsys.readouterr().out
+    assert code == 0
+    assert offline == ["hotpotqa", "2wikimultihopqa", "musique", "bamboogle"]
+    assert (out / "corpus.jsonl").is_file()  # 01_build_index.sh's CORPUS default
+    assert (out / "manifest.json").is_file()
+    assert any(out.glob("hotpotqa_*.jsonl"))
+    assert (out / "musique_ood.jsonl").is_file()
+    assert "coverage UNMEASURED" in printed
+
+
+def test_a_prepared_dev_file_feeds_eval_context(tmp_path: Path, offline: list[str]) -> None:
+    """`03_eval.sh` reads `<dataset>_dev.jsonl`. Chained here so the naming
+    convention is checked by the thing that depends on it."""
+    out = tmp_path / "processed"
+    assert main(["prepare-data", "--out", str(out), "--datasets", "hotpotqa"]) == 0
+    dev_files = sorted(out.glob("hotpotqa_*.jsonl"))
+    assert dev_files, "no hotpotqa split files"
+    code = main(
+        [
+            "eval-context",
+            "--index",
+            str(build_real_index(tmp_path / "index")),
+            "--examples",
+            str(dev_files[0]),
+            "--dataset",
+            "hotpotqa",
+            "--split",
+            dev_files[0].stem.split("_", 1)[1],
+            "--out",
+            str(tmp_path / "context.json"),
+        ]
+    )
+    assert code == 0
+
+
+def test_prepare_data_plan_downloads_nothing(
+    tmp_path: Path, offline: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "processed"
+    assert main(["--plan", "prepare-data", "--out", str(out)]) == 0
+    assert offline == []
+    assert not out.exists()
+    assert "hotpotqa/hotpot_qa (distractor)" in capsys.readouterr().out
+
+
+def test_prepare_data_refuses_to_overwrite_a_finished_build(
+    tmp_path: Path, offline: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "processed"
+    assert main(["prepare-data", "--out", str(out)]) == 0
+    offline.clear()
+    capsys.readouterr()
+
+    assert main(["prepare-data", "--out", str(out)]) == 2
+    assert "already holds a finished build" in capsys.readouterr().err
+    assert offline == []  # refused before downloading anything
+    assert main(["prepare-data", "--out", str(out), "--force"]) == 0
+
+
+def test_prepare_data_passes_the_limit_to_the_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Both halves: the download is asked for 3 rows, and the manifest says the
+    build is limited. Either alone would let a smoke build pass as the data."""
+    limits: list[int | None] = []
+
+    def recording(spec: DatasetSpec, limit: int | None = None) -> Iterator[dict[str, object]]:
+        limits.append(limit)
+        return fixture_rows(spec, limit)
+
+    monkeypatch.setattr("verisearch.cli.download_rows", recording)
+    code = main(["prepare-data", "--out", str(tmp_path / "p"), "--limit", "3"])
+    assert code == 0
+    assert limits == [3, 3, 3, 3]
+    assert "LIMITED to 3 rows per split" in capsys.readouterr().out
+
+
+def test_prepare_data_exits_1_when_a_gold_paragraph_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def gold_elsewhere(spec: DatasetSpec, limit: int | None = None) -> Iterator[dict[str, object]]:
+        yield {
+            "id": "h0",
+            "question": "Where is it?",
+            "answer": "here",
+            "supporting_facts": {"title": ["Missing"], "sent_id": [0]},
+            "context": {"title": ["Present"], "sentences": [["Text."]]},
+        }
+
+    monkeypatch.setattr("verisearch.cli.download_rows", gold_elsewhere)
+    out = tmp_path / "processed"
+    code = main(["prepare-data", "--out", str(out), "--datasets", "hotpotqa"])
+
+    assert code == 1
+    assert "recall is capped" in capsys.readouterr().err
+    assert (out / "manifest.json").is_file()  # written, for diagnosis
+
+
+def test_prepare_data_reports_a_bad_field_map_in_one_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The first live download is what checks the field maps. When one is
+    wrong, the message has to say which keys the row really had."""
+
+    def wrong_schema(spec: DatasetSpec, limit: int | None = None) -> Iterator[dict[str, object]]:
+        yield {"qid": "x", "q": "?", "a": "!"}
+
+    monkeypatch.setattr("verisearch.cli.download_rows", wrong_schema)
+    code = main(["prepare-data", "--out", str(tmp_path / "p"), "--datasets", "hotpotqa"])
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "Keys present: a, q, qid" in err
+    assert err.count("\n") == 1
+
+
+def test_prepare_data_rejects_an_unknown_dataset() -> None:
+    with pytest.raises(SystemExit):
+        main(["prepare-data", "--datasets", "squad"])
