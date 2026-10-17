@@ -172,20 +172,33 @@ class FaithfulnessResult(BaseModel):
     model_config = _FROZEN
 
     claims: tuple[Claim, ...]
+    # DECIDED: `score` is 0.0 when `claims` is empty. Dhrubo's call, on #2, as
+    # reward design: 1.0 would be a safe harbour, paying `w_a * 1.0 = 0.5` for
+    # answering in unfalsifiable language, which beats trying and being partly
+    # unsupported. It does punish an honest "the passages do not say", which is
+    # accepted because correctness dominates and the canaries will show it.
+    # `tests/test_rewards.py` gets a case for it.
     score: float = Field(ge=0.0, le=1.0)
-    # DECIDE: what is `score` when `claims` is empty?
-    #   0.0  - punishes an answer with no checkable claims. Also punishes an
-    #          honest "the passages do not say", which may be behaviour we want.
-    #   1.0  - vacuously faithful. Invites a degenerate "I don't know" policy.
-    #   None - forces every caller to branch. Honest, and annoying.
-    # A reward-design question, not a typing one, so it belongs to the session.
-    # Whatever we pick, `tests/test_rewards.py` gets a case for it.
 
     @property
-    def unsupported_rate(self) -> float:
-        """Headline metric from PROJECT.md section 9. 0.0 when there are no claims."""
+    def unsupported_rate(self) -> float | None:
+        """Headline metric from PROJECT.md section 9. None when there are no claims.
+
+        Not 0.0. An answer with nothing checkable in it is not perfectly
+        faithful - it is unmeasured, and 0.0 is the best possible value this
+        metric can take. Reporting it would mean a policy that learned to answer
+        in unfalsifiable language appears at the top of the headline
+        hallucination number, which is the opposite of what section 9 asks this
+        metric to detect. It would also contradict `score` scoring that same
+        trajectory 0.0 - the two numbers describing one trajectory as both the
+        worst and the best possible.
+
+        None propagates: `eval.harness.aggregate` drops it from the mean rather
+        than counting it as a zero, and a run where it is None for every example
+        reports `n/a` instead of a flattering number nobody measured.
+        """
         if not self.claims:
-            return 0.0
+            return None
         unsupported = sum(1 for c in self.claims if c.label is not Entailment.ENTAILED)
         return unsupported / len(self.claims)
 

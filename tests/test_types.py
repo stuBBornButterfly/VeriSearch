@@ -82,7 +82,6 @@ def test_every_turn_kind_is_covered_by_the_masking_rule() -> None:
 @pytest.mark.parametrize(
     ("labels", "expected"),
     [
-        pytest.param((), 0.0, id="no-claims"),
         pytest.param((Entailment.ENTAILED,), 0.0, id="all-entailed"),
         pytest.param((Entailment.NEUTRAL,), 1.0, id="all-neutral"),
         pytest.param((Entailment.CONTRADICTED,), 1.0, id="all-contradicted"),
@@ -383,3 +382,24 @@ def test_reward_breakdown_still_accepts_a_plain_dict() -> None:
     )
     assert breakdown.components["correctness"] == 1.0
     assert breakdown.penalties["duplicate_query"] == -0.1
+
+
+def test_unsupported_rate_is_none_when_there_is_nothing_to_check() -> None:
+    """Finding 3. Not 0.0, which is this metric's *best* possible value.
+
+    An answer with no checkable claims is unmeasured, not perfectly faithful.
+    Returning 0.0 would put a policy that learned to answer in unfalsifiable
+    language at the top of section 9's headline hallucination number, and would
+    contradict `score`, which calls that same trajectory 0.0 - one trajectory
+    described as both the worst and the best possible.
+    """
+    result = FaithfulnessResult(claims=(), score=0.0)
+    assert result.unsupported_rate is None
+
+
+def test_an_answer_with_claims_still_reports_a_rate() -> None:
+    """None means 'nothing to check', never 'nothing was unsupported'."""
+    supported = FaithfulnessResult(
+        claims=(Claim(text="checkable", label=Entailment.ENTAILED),), score=1.0
+    )
+    assert supported.unsupported_rate == 0.0
