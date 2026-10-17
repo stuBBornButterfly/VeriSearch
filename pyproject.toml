@@ -42,6 +42,14 @@ retrieval = [
     "uvicorn>=0.30",
 ]
 
+# Plotting only. Its own extra rather than [dev] because the PR pipeline
+# installs core + [dev] on every build and matplotlib is ~30 MB of wheels for
+# code CI can never exercise: `eval/frontier.py` keeps every decision in pure
+# functions above the figure, and only the lines that draw it need this.
+plot = [
+    "matplotlib>=3.8,<4",
+]
+
 # Dhrubo's half. GPU box only. Never installed in the PR pipeline.
 train = [
     "torch>=2.3",
@@ -73,10 +81,15 @@ files = ["verisearch"]
 # deferred and guarded. Adding a name here is not a relaxation of strict - it
 # says "this package is not installed", not "do not check this code".
 [[tool.mypy.overrides]]
+# Everything in an optional extra. None of it is installed in the PR pipeline, so
+# mypy cannot see stubs for any of it; every import site is deferred and guarded.
+# Adding a name here is not a relaxation of strict - it says "this package is not
+# installed", not "do not check this code".
 module = [
     "datasets.*",
     "faiss.*",
     "fastapi.*",
+    "matplotlib.*",
     "peft.*",
     "sentence_transformers.*",
     "vllm.*",
