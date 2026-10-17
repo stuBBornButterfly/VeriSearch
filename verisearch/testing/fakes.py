@@ -220,8 +220,14 @@ class FakeFaithfulnessScorer:
         self._empty_claims_score = empty_claims_score
         self._threshold = support_threshold
 
-    def score(self, answer: str, passages: list[Passage]) -> FaithfulnessResult:
-        """Label every sentence of `answer` against `passages`."""
+    def score(self, answer: str, passages: Sequence[Passage]) -> FaithfulnessResult:
+        """Label every sentence of `answer` against `passages`.
+
+        `Sequence`, matching the protocol: a `list` parameter would force every
+        caller holding `Trajectory.retrieved_passages` - a tuple - to copy it
+        into a list just to satisfy the signature. `conformance_witnesses` below
+        is what caught this when the contract changed.
+        """
         per_passage = {p.doc_id: _tokens(f"{p.title} {p.text}") for p in passages}
         claims: list[Claim] = []
         for sentence in _split_sentences(answer):
