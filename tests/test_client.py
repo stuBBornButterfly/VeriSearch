@@ -28,6 +28,7 @@ from verisearch.retrieval.client import (
     StoredDoc,
     conformance_witnesses,
     load_doc_store,
+    page_key,
 )
 from verisearch.retrieval.embedder import EmbedderSpec, l2_normalize
 from verisearch.retrieval.index import BruteForceIndex, IndexHit, VectorIndexError
@@ -322,6 +323,10 @@ def test_a_hit_the_store_cannot_resolve_is_an_error_not_a_short_result() -> None
         def __len__(self) -> int:
             return 4
 
+        @property
+        def max_versions_per_page(self) -> int:
+            return 1
+
     retriever = LocalRetriever(make_index(), TableEmbedder(SPEC, QUERY_VECTORS), HalfStore())
     with pytest.raises(RetrievalError, match="not in the document store"):
         retriever.search("analytical engine", 2)
@@ -449,3 +454,144 @@ def test_an_index_hit_carries_no_text_so_the_join_is_the_only_source() -> None:
     hit = IndexHit(doc_id="d1", score=0.5, row=0)
     assert not hasattr(hit, "text")
     assert not hasattr(hit, "title")
+
+
+# ---------------------------------------------------------------------------
+# One passage per page
+# ---------------------------------------------------------------------------
+
+PAGE_SPEC = EmbedderSpec(model_name="page-test", dim=6, normalize=True)
+
+# Three versions of one page (one spelled with an underscore), two articles
+# that differ only in case, and two ordinary pages.
+PAGE_DOCS: list[tuple[str, str, str, list[float]]] = [
+    ("a1", "Ada Lovelace", "Version one.", [1.0, 0.00, 0.0, 0.0, 0.0, 0.0]),
+    ("a2", "Ada Lovelace", "Version two.", [1.0, 0.08, 0.0, 0.0, 0.0, 0.0]),
+    ("a3", "Ada_Lovelace", "Version three.", [1.0, 0.12, 0.0, 0.0, 0.0, 0.0]),
+    ("b", "Analytical Engine", "The engine.", [0.0, 1.00, 0.0, 0.0, 0.0, 0.0]),
+    ("s1", "Smash Cut", "A 2009 horror film.", [0.0, 0.0, 1.0, 0.00, 0.0, 0.0]),
+    ("s2", "Smash cut", "An editing technique.", [0.0, 0.0, 1.0, 0.10, 0.0, 0.0]),
+    ("c", "Charles Babbage", "The inventor.", [0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+]
+PAGE_QUERIES: dict[str, list[float]] = {
+    # Exactly on a1, so the versions rank a1 > a2 > a3 and all three outrank
+    # every other page; the rest tie at zero and the index breaks ties on row.
+    "ada": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    # Exactly on s1, with s2 a close second.
+    "smash": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+}
+
+
+class DepthSpy(BruteForceIndex):
+    """Records the depth each search asked the index for."""
+
+    depths: list[int]
+
+    def search(self, queries: NDArray[np.float32], k: int) -> list[list[IndexHit]]:
+        self.depths.append(k)
+        return super().search(queries, k)
+
+
+def page_index_and_store() -> tuple[DepthSpy, InMemoryDocStore]:
+    ids = [doc_id for doc_id, _, _, _ in PAGE_DOCS]
+    vectors = l2_normalize(np.asarray([v for _, _, _, v in PAGE_DOCS], dtype=np.float32))
+    built = BruteForceIndex.build(vectors, ids, PAGE_SPEC)
+    index = DepthSpy.__new__(DepthSpy)
+    index.__dict__.update(built.__dict__)
+    index.depths = []
+    store = InMemoryDocStore.from_records(
+        StoredDoc(doc_id=doc_id, title=title, text=text) for doc_id, title, text, _ in PAGE_DOCS
+    )
+    return index, store
+
+
+def page_retriever(*, one_per_page: bool = True) -> tuple[LocalRetriever, DepthSpy]:
+    index, store = page_index_and_store()
+    retriever = LocalRetriever(
+        index, TableEmbedder(PAGE_SPEC, PAGE_QUERIES), store, one_per_page=one_per_page
+    )
+    return retriever, index
+
+
+def test_versions_of_one_page_come_back_once_best_version_first() -> None:
+    """The corpus keeps every version of a paragraph. Without this, "ada" at k=2
+    would be one article twice."""
+    retriever, _ = page_retriever()
+    passages = retriever.search("ada", 2)
+    assert [p.doc_id for p in passages] == ["a1", "b"]
+
+
+def test_an_underscore_spelling_is_the_same_page() -> None:
+    retriever, _ = page_retriever()
+    titles = [p.title for p in retriever.search("ada", 4)]
+    assert sum(1 for t in titles if page_key(t) == "Ada Lovelace") == 1
+
+
+def test_two_articles_that_differ_only_in_case_are_both_returned() -> None:
+    """The case collision the lowercased title merged: a film and an editing
+    technique. Folding case here would throw one article away."""
+    retriever, _ = page_retriever()
+    assert [p.title for p in retriever.search("smash", 2)] == ["Smash Cut", "Smash cut"]
+
+
+def test_the_index_is_asked_for_k_times_the_most_versions_any_page_has() -> None:
+    """Pigeonhole: with at most 3 versions a page, the top 6 hits hold at least
+    2 distinct pages. The depth comes from the store, not from a constant."""
+    retriever, index = page_retriever()
+    retriever.search("ada", 2)
+    assert index.depths == [2 * 3]
+
+
+def test_exactly_k_pages_even_when_versions_fill_the_top_hits() -> None:
+    """The worst case the depth exists for: every one of the top three hits is a
+    version of the same page, and k=3 still gets three different pages."""
+    retriever, _ = page_retriever()
+    passages = retriever.search("ada", 3)
+    assert len(passages) == 3
+    assert len({page_key(p.title) for p in passages}) == 3
+
+
+def test_the_batch_path_deduplicates_the_same_way() -> None:
+    retriever, _ = page_retriever()
+    batched = retriever.search_batch(["ada", "smash"], 2)
+    assert batched == [retriever.search("ada", 2), retriever.search("smash", 2)]
+
+
+def test_raw_mode_returns_the_index_top_k_versions_and_all() -> None:
+    retriever, index = page_retriever(one_per_page=False)
+    assert [p.doc_id for p in retriever.search("ada", 2)] == ["a1", "a2"]
+    assert index.depths == [2]
+
+
+def test_a_store_knows_its_most_versioned_page() -> None:
+    store = InMemoryDocStore.from_records(
+        StoredDoc(doc_id=doc_id, title=title, text=text) for doc_id, title, text, _ in PAGE_DOCS
+    )
+    assert store.max_versions_per_page == 3
+
+
+def test_an_empty_store_counts_one_version_rather_than_none() -> None:
+    """The constructor allows it even though `from_records` refuses one; the
+    depth multiplier must stay at least 1 either way."""
+    assert InMemoryDocStore({}).max_versions_per_page == 1
+
+
+@pytest.mark.parametrize(
+    ("title", "key"),
+    [
+        ("Ada_Lovelace", "Ada Lovelace"),
+        ("  Ada   Lovelace ", "Ada Lovelace"),
+        ("Smash Cut", "Smash Cut"),
+        ("Smash cut", "Smash cut"),
+    ],
+)
+def test_page_key_folds_spacing_but_not_case(title: str, key: str) -> None:
+    assert page_key(title) == key
+
+
+def test_one_per_page_is_the_default() -> None:
+    """Training and eval construct a retriever without the flag, so the default
+    is the behaviour they get. Raw mode has to be asked for."""
+    index, store = page_index_and_store()
+    default = LocalRetriever(index, TableEmbedder(PAGE_SPEC, PAGE_QUERIES), store)
+    assert [p.doc_id for p in default.search("ada", 2)] == ["a1", "b"]
