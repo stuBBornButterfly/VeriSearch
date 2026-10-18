@@ -12,11 +12,16 @@ a mirror that changed between calls, a different row limit - and the coverage
 check below would then compare examples against a corpus built from other
 rows, and pass.
 
-**Coverage is the gate.** Every supporting title of every example must be a
-document in the corpus. A missing one caps recall below 1.0, caps accuracy
-with it, and nothing else reports it - the cap looks exactly like a model that
-did not learn (`build_corpus.find_missing_titles`). A dataset whose examples
-carry no supporting titles is reported as *unmeasured*, never as covered.
+**Coverage is the gate, at the level of the sentence.** Every supporting fact
+names a title and a sentence. The sentence, as the example's own context
+gives it, must appear in some corpus document with that title. A title being
+present is not enough: the first full build had every title present and was
+missing the answering sentence for 6.6% of 2WikiMultihopQA's facts, because
+one version of each paragraph had been kept and the others dropped. A missing
+sentence caps what the policy can find, and the cap looks exactly like a model
+that did not learn. Titles are still checked, as the cheaper diagnostic. A
+dataset whose examples carry no supporting facts is reported as *unmeasured*,
+never as covered.
 
 **Leakage is reported, not fixed.** `splits.find_leakage` says why: what to do
 about a near-duplicate that lands in two splits is a judgement call for the
@@ -50,7 +55,9 @@ from verisearch.data.build_corpus import (
     CorpusDoc,
     CorpusStats,
     build_corpus,
+    extra_versions,
     find_missing_titles,
+    normalize_title,
     summarize_corpus,
     write_corpus,
 )
@@ -100,6 +107,13 @@ class DatasetPart(BaseModel):
     spec: DatasetSpec
     examples: tuple[QAExample, ...]
     corpus: CorpusBuild | None
+    # (normalised title, whitespace-normalised sentence) for every supporting
+    # fact, taken from the example's own context.
+    evidence: tuple[tuple[str, str], ...] = ()
+    # Supporting facts that could not be resolved to a sentence in their own
+    # row - an id past the end of the paragraph, a title the context does not
+    # have. A defect in the data, not in the corpus, so counted, not failed.
+    evidence_unreadable: int = Field(default=0, ge=0)
 
 
 class DatasetSummary(BaseModel):
@@ -118,10 +132,15 @@ class DatasetSummary(BaseModel):
     # this dataset is unmeasured - not that it is complete.
     titles_checked: int = Field(ge=0)
     titles_missing: int = Field(ge=0)
+    # Supporting sentences checked, and how many are in no document with their
+    # title. The gate - see the module docstring.
+    evidence_checked: int = Field(ge=0)
+    evidence_missing: int = Field(ge=0)
+    evidence_unreadable: int = Field(ge=0)
 
     @property
     def coverage_measured(self) -> bool:
-        return self.titles_checked > 0
+        return self.titles_checked > 0 or self.evidence_checked > 0
 
 
 class Manifest(BaseModel):
@@ -139,26 +158,34 @@ class Manifest(BaseModel):
     datasets: tuple[DatasetSummary, ...]
     split_report: SplitReport
     corpus: CorpusStats
-    # Same normalised title, different text: which text a document carries
-    # then depends on row order. See `CorpusBuild.n_title_conflicts`.
-    corpus_title_conflicts: int = Field(ge=0)
+    # Documents beyond the first for their title - several versions of one page,
+    # all kept. See `CorpusBuild`.
+    corpus_extra_versions: int = Field(ge=0)
     leakage_groups: int = Field(ge=0)
     missing_titles: int = Field(ge=0)
     missing_titles_sample: tuple[str, ...]
+    evidence_missing: int = Field(ge=0)
+    evidence_missing_sample: tuple[str, ...]
+    evidence_unreadable: int = Field(ge=0)
     files: tuple[str, ...]
 
     def problems(self) -> tuple[str, ...]:
         """Why these files should not be trained or evaluated on, if they should not.
 
-        Only coverage is here. Leakage and title conflicts are reported in
+        Only coverage is here. Leakage and extra versions are reported in
         `summary` and need a decision, but they do not make the files unusable;
-        a gold paragraph missing from the corpus does.
+        gold evidence missing from the corpus does.
         """
         found = []
         if self.missing_titles:
             found.append(
                 f"{self.missing_titles} supporting titles have no document in the corpus, so "
                 f"recall is capped below 1.0 for the questions that need them"
+            )
+        if self.evidence_missing:
+            found.append(
+                f"{self.evidence_missing} supporting sentences are in no corpus document with "
+                f"their title, so the evidence for those facts cannot be retrieved"
             )
         return tuple(found)
 
@@ -169,18 +196,25 @@ class Manifest(BaseModel):
         for dataset in self.datasets:
             counts = ", ".join(f"{split}={n}" for split, n in sorted(dataset.splits.items()))
             coverage = (
-                f"{dataset.titles_missing} of {dataset.titles_checked} titles missing"
+                f"{dataset.titles_missing} of {dataset.titles_checked} titles and "
+                f"{dataset.evidence_missing} of {dataset.evidence_checked} gold sentences "
+                f"missing, {dataset.evidence_unreadable} facts unreadable"
                 if dataset.coverage_measured
-                else "coverage UNMEASURED - no supporting titles"
+                else "coverage UNMEASURED - no supporting facts"
             )
             source = "corpus source" if dataset.contributes_to_corpus else "no paragraphs"
             lines.append(f"  {dataset.name:<16} {counts}; {source}; {coverage}")
         lines.append(
             f"corpus      {self.corpus.n_docs} docs, median {self.corpus.median_chars} chars, "
-            f"p95 {self.corpus.p95_chars}, {self.corpus_title_conflicts} title conflicts"
+            f"p95 {self.corpus.p95_chars}, {self.corpus_extra_versions} extra versions of a "
+            f"title kept"
         )
         lines.append(f"leakage     {self.leakage_groups} groups across splits (see leakage.json)")
         lines.append(f"missing     {self.missing_titles} supporting titles not in the corpus")
+        lines.append(
+            f"evidence    {self.evidence_missing} gold sentences not in the corpus, "
+            f"{self.evidence_unreadable} facts unreadable in their own row"
+        )
         return "\n".join(lines)
 
 
@@ -204,31 +238,144 @@ def read_dataset(rows: Iterable[Mapping[str, object]], spec: DatasetSpec) -> Dat
     once and its two outputs cannot come from different rows.
     """
     examples: list[QAExample] = []
+    evidence: list[tuple[str, str]] = []
+    unreadable = 0
 
     def tap() -> Iterator[Mapping[str, object]]:
+        nonlocal unreadable
         for row in rows:
             examples.append(row_to_example(row, spec))
+            found, bad = supporting_evidence(row, spec)
+            evidence.extend(found)
+            unreadable += bad
             yield row
 
+    corpus: CorpusBuild | None = None
     if spec.context_key is None:
         for _ in tap():
             pass
-        return DatasetPart(spec=spec, examples=tuple(examples), corpus=None)
-    corpus = build_corpus(tap(), spec, context_key=spec.context_key)
-    return DatasetPart(spec=spec, examples=tuple(examples), corpus=corpus)
+    else:
+        corpus = build_corpus(tap(), spec, context_key=spec.context_key)
+    return DatasetPart(
+        spec=spec,
+        examples=tuple(examples),
+        corpus=corpus,
+        evidence=tuple(evidence),
+        evidence_unreadable=unreadable,
+    )
+
+
+def _sentences_by_title(value: object) -> dict[str, Sequence[object]]:
+    """A row's own context as title -> sentences, in either published shape."""
+    pairs: Iterable[tuple[object, object]]
+    if isinstance(value, Mapping):
+        titles = value.get("title", [])
+        groups = value.get("sentences", [])
+        if not isinstance(titles, (list, tuple)) or not isinstance(groups, (list, tuple)):
+            return {}
+        pairs = zip(titles, groups, strict=False)
+    elif isinstance(value, (list, tuple)):
+        pairs = (
+            (item[0], item[1])
+            for item in value
+            if isinstance(item, (list, tuple)) and len(item) >= 2
+        )
+    else:
+        return {}
+    found: dict[str, Sequence[object]] = {}
+    for title, group in pairs:
+        if isinstance(title, str) and isinstance(group, (list, tuple)):
+            found.setdefault(title, group)
+    return found
+
+
+def _supporting_facts(value: object) -> tuple[list[tuple[object, object]], int]:
+    """(title, sentence id) pairs, in either published shape, and how many items
+    were not pairs at all - a flattened title list has no sentence to check."""
+    if isinstance(value, Mapping):
+        titles = value.get("title", [])
+        ids = value.get("sent_id", [])
+        if not isinstance(titles, (list, tuple)) or not isinstance(ids, (list, tuple)):
+            return [], 0
+        return list(zip(titles, ids, strict=False)), 0
+    if not isinstance(value, (list, tuple)):
+        return [], 0
+    facts: list[tuple[object, object]] = []
+    skipped = 0
+    for item in value:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            facts.append((item[0], item[1]))
+        else:
+            skipped += 1
+    return facts, skipped
+
+
+def supporting_evidence(
+    row: Mapping[str, object], spec: DatasetSpec
+) -> tuple[tuple[tuple[str, str], ...], int]:
+    """Each supporting fact's sentence from the row's own context, and how many
+    facts could not be resolved to one.
+
+    Titles are normalised as the corpus normalises them and sentences have their
+    whitespace collapsed, so the check compares content rather than spacing.
+    """
+    if spec.supporting_facts_key is None or spec.context_key is None:
+        return (), 0
+    if spec.supporting_facts_key not in row or spec.context_key not in row:
+        return (), 0
+    context = _sentences_by_title(row[spec.context_key])
+    facts, unreadable = _supporting_facts(row[spec.supporting_facts_key])
+    found: list[tuple[str, str]] = []
+    for title, sent_id in facts:
+        if not isinstance(title, str) or not isinstance(sent_id, int) or isinstance(sent_id, bool):
+            unreadable += 1
+            continue
+        sentences = context.get(title)
+        if sentences is None or not 0 <= sent_id < len(sentences):
+            unreadable += 1
+            continue
+        raw = sentences[sent_id]
+        sentence = " ".join(raw.split()) if isinstance(raw, str) else ""
+        if not sentence:
+            unreadable += 1
+            continue
+        found.append((normalize_title(title), sentence))
+    return tuple(found), unreadable
+
+
+def _evidence_index(docs: Iterable[CorpusDoc]) -> dict[str, tuple[str, ...]]:
+    """Normalised title -> the text of every version.
+
+    The text is used as built: `build_corpus` already collapses whitespace when
+    it joins a paragraph's sentences, so only the sentence side needs it.
+    """
+    index: dict[str, list[str]] = {}
+    for doc in docs:
+        index.setdefault(normalize_title(doc.title), []).append(doc.text)
+    return {title: tuple(texts) for title, texts in index.items()}
+
+
+def missing_evidence(
+    evidence: Iterable[tuple[str, str]], index: Mapping[str, Sequence[str]]
+) -> list[tuple[str, str]]:
+    """The facts whose sentence appears in no document carrying their title."""
+    return [
+        (title, sentence)
+        for title, sentence in evidence
+        if not any(sentence in text for text in index.get(title, ()))
+    ]
 
 
 def merge_corpora(builds: Sequence[CorpusBuild]) -> CorpusBuild:
-    """One corpus from several, deduplicated on `doc_id`, first dataset wins.
+    """One corpus from several, by the rule `build_corpus` applies within one.
 
-    The same Wikipedia title can come from HotpotQA and from 2WikiMultihopQA
-    with different text. Keeping the first is deterministic for a fixed dataset
-    order, but the losing text is gone - so a cross-dataset clash is counted as
-    a title conflict, exactly as a clash within one dataset is.
+    A document is a title and a text, so the same page from HotpotQA and from
+    2WikiMultihopQA is one document when the text matches and two when it does
+    not. Neither dataset's version is dropped, and the result does not depend
+    on the order the datasets are listed in.
     """
     kept: dict[str, CorpusDoc] = {}
     duplicates = 0
-    conflicts = 0
     for build in builds:
         for doc in build.docs:
             existing = kept.get(doc.doc_id)
@@ -236,14 +383,15 @@ def merge_corpora(builds: Sequence[CorpusBuild]) -> CorpusBuild:
                 kept[doc.doc_id] = doc
                 continue
             duplicates += 1
-            if existing.text != doc.text:
-                conflicts += 1
+            if doc.title < existing.title:
+                kept[doc.doc_id] = doc
+    docs = tuple(sorted(kept.values(), key=lambda doc: doc.doc_id))
     return CorpusBuild(
-        docs=tuple(sorted(kept.values(), key=lambda doc: doc.doc_id)),
+        docs=docs,
         n_rows=sum(build.n_rows for build in builds),
         n_paragraphs=sum(build.n_paragraphs for build in builds),
-        n_duplicate_titles=sum(build.n_duplicate_titles for build in builds) + duplicates,
-        n_title_conflicts=sum(build.n_title_conflicts for build in builds) + conflicts,
+        n_duplicate_paragraphs=sum(build.n_duplicate_paragraphs for build in builds) + duplicates,
+        n_extra_versions=extra_versions(docs),
         n_empty_skipped=sum(build.n_empty_skipped for build in builds),
     )
 
@@ -271,12 +419,16 @@ def assemble(
             "is nothing to retrieve from"
         )
 
+    index = _evidence_index(corpus.docs)
     missing_all: list[str] = []
+    evidence_gone: list[tuple[str, str]] = []
     summaries: list[DatasetSummary] = []
     for part in parts:
         own = [e for e in examples if e.dataset == part.spec.name]
         missing = find_missing_titles(own, corpus.docs)
         missing_all.extend(missing)
+        gone = missing_evidence(part.evidence, index)
+        evidence_gone.extend(gone)
         summaries.append(
             DatasetSummary(
                 name=part.spec.name,
@@ -288,6 +440,9 @@ def assemble(
                 contributes_to_corpus=part.corpus is not None,
                 titles_checked=len({t for e in own for t in e.supporting_titles}),
                 titles_missing=len(missing),
+                evidence_checked=len(part.evidence),
+                evidence_missing=len(gone),
+                evidence_unreadable=part.evidence_unreadable,
             )
         )
 
@@ -302,10 +457,15 @@ def assemble(
         datasets=tuple(summaries),
         split_report=summarize(examples, seed),
         corpus=summarize_corpus(corpus.docs),
-        corpus_title_conflicts=corpus.n_title_conflicts,
+        corpus_extra_versions=corpus.n_extra_versions,
         leakage_groups=len(leakage),
         missing_titles=len(missing_sorted),
         missing_titles_sample=missing_sorted[:_MISSING_SAMPLE],
+        evidence_missing=len(evidence_gone),
+        evidence_missing_sample=tuple(
+            f"{title}: {sentence[:80]}" for title, sentence in evidence_gone[:_MISSING_SAMPLE]
+        ),
+        evidence_unreadable=sum(part.evidence_unreadable for part in parts),
         files=tuple(sorted(_planned_files(examples))),
     )
     return Prepared(examples=examples, corpus=corpus, leakage=leakage, manifest=manifest)

@@ -69,12 +69,18 @@ class CorpusDoc(BaseModel):
 class CorpusBuild(BaseModel):
     """Corpus plus the counts that tell you whether it is the corpus you wanted.
 
-    `n_title_conflicts` is the one to watch. HotpotQA ships the same paragraph
-    alongside many different questions, and the copies are not always
-    byte-identical. A non-zero conflict count means the text of those documents
-    depends on row order, so the corpus - and therefore every embedding and
-    every retrieval result - is not reproducible from the dataset alone. Decide
-    what to do about it deliberately; do not let it pass unnoticed.
+    **A document is a title and a text, not a title.** The datasets ship the
+    same Wikipedia paragraph many times and the copies are not always
+    identical - 2WikiMultihopQA especially carries several versions of one
+    abstract, differing in leftover markup. Keeping one version per title
+    dropped the others, and with them, on the first full build, the sentence
+    that answers 6.6% of 2WikiMultihopQA's supporting facts - while a
+    title-level coverage check reported nothing missing. So every distinct
+    version is its own document, and the corpus no longer depends on row order.
+
+    `n_extra_versions` counts documents beyond the first for their normalised
+    title. The cost it measures is retrieval's: several versions of one page can
+    fill the top k.
     """
 
     model_config = _FROZEN
@@ -82,8 +88,9 @@ class CorpusBuild(BaseModel):
     docs: tuple[CorpusDoc, ...]
     n_rows: int = Field(ge=0)
     n_paragraphs: int = Field(ge=0)
-    n_duplicate_titles: int = Field(ge=0)
-    n_title_conflicts: int = Field(ge=0)
+    # Paragraphs whose title and text were both already in the corpus.
+    n_duplicate_paragraphs: int = Field(ge=0)
+    n_extra_versions: int = Field(ge=0)
     n_empty_skipped: int = Field(ge=0)
 
 
@@ -116,20 +123,24 @@ def normalize_title(title: str) -> str:
     return _TITLE_NOISE.sub(" ", title).strip().lower()
 
 
-def doc_id_for(title: str) -> str:
-    """Stable document id derived from the normalised title.
+def doc_id_for(title: str, text: str) -> str:
+    """Stable document id from the normalised title and the text.
 
-    Titles are the natural key - `supporting_facts` references them - but they
-    carry spaces, punctuation and case variants, which makes them poor ids for
-    filenames, index metadata and JSONL joins. A hash of the normalised title is
-    stable across runs, processes and machines, which `hash()` is not: Python
-    randomises string hashing per process unless `PYTHONHASHSEED` is set, and
-    the Jenkins pipeline deliberately leaves it unset.
+    Both, because a document is a version of a paragraph: two copies of one
+    page that differ in their text are two documents (see `CorpusBuild`). The
+    title is normalised so that `Ada_Lovelace` and `ada lovelace` with the same
+    text are one document; the text is not, because the text is what gets
+    embedded and checked for evidence. "Smash Cut", a film, and "Smash cut", an
+    editing technique, normalise to one title and stay two documents.
+
+    A hash, stable across runs, processes and machines, which `hash()` is not:
+    Python randomises string hashing per process unless `PYTHONHASHSEED` is
+    set, and the Jenkins pipeline deliberately leaves it unset.
     """
     canonical = normalize_title(title)
     if not canonical:
         raise DataError("cannot build a doc_id from a blank title")
-    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    return hashlib.sha256(f"{canonical}\x00{text}".encode()).hexdigest()[:16]
 
 
 def paragraphs_from_context(
@@ -212,16 +223,16 @@ def build_corpus(
 ) -> CorpusBuild:
     """Collapse every row's context paragraphs into a deduplicated corpus.
 
-    Deduplication is on the **normalised** title, keeping the first text seen.
-    Documents come back sorted by `doc_id`, so the corpus is byte-identical
-    across runs for the same input and a diff between two builds means the data
-    changed rather than the iteration order.
+    Deduplication is on the normalised title **and** the text: identical copies
+    collapse, distinct versions are all kept. Documents come back sorted by
+    `doc_id`, and when identical text arrives under two spellings of a title
+    the smaller spelling is kept - so the corpus is the same for any order of
+    the same rows, and a diff between two builds means the data changed.
     """
     seen: dict[str, CorpusDoc] = {}
     n_rows = 0
     n_paragraphs = 0
-    n_duplicate_titles = 0
-    n_title_conflicts = 0
+    n_duplicate_paragraphs = 0
     n_empty_skipped = 0
 
     for row in rows:
@@ -236,23 +247,30 @@ def build_corpus(
                 # query equally badly. Keep it out of the index.
                 n_empty_skipped += 1
                 continue
-            doc_id = doc_id_for(title)
+            doc_id = doc_id_for(title, text)
             existing = seen.get(doc_id)
             if existing is None:
                 seen[doc_id] = CorpusDoc(doc_id=doc_id, title=title, text=text)
                 continue
-            n_duplicate_titles += 1
-            if existing.text != text:
-                n_title_conflicts += 1
+            n_duplicate_paragraphs += 1
+            if title < existing.title:
+                seen[doc_id] = CorpusDoc(doc_id=doc_id, title=title, text=text)
 
+    docs = tuple(sorted(seen.values(), key=lambda doc: doc.doc_id))
     return CorpusBuild(
-        docs=tuple(sorted(seen.values(), key=lambda doc: doc.doc_id)),
+        docs=docs,
         n_rows=n_rows,
         n_paragraphs=n_paragraphs,
-        n_duplicate_titles=n_duplicate_titles,
-        n_title_conflicts=n_title_conflicts,
+        n_duplicate_paragraphs=n_duplicate_paragraphs,
+        n_extra_versions=extra_versions(docs),
         n_empty_skipped=n_empty_skipped,
     )
+
+
+def extra_versions(docs: Iterable[CorpusDoc]) -> int:
+    """Documents beyond the first for each normalised title."""
+    ordered = list(docs)
+    return len(ordered) - len({normalize_title(doc.title) for doc in ordered})
 
 
 def summarize_corpus(docs: Sequence[CorpusDoc]) -> CorpusStats:
