@@ -27,6 +27,10 @@ data/raw/
 data/processed/
 # Smoke builds (`prepare-data --limit N`). Never data, never committed.
 data/smoke/
+# Where scripts/01_build_index.sh writes. `*.faiss` below catches the HNSW
+# graph but not doc_ids.json beside it, nor a brute-force index's vectors.npy
+# (1.4 GB on the full corpus).
+data/index/
 indexes/
 checkpoints/
 outputs/

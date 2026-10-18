@@ -145,10 +145,10 @@ def check_matrix(matrix: NDArray[np.float32], spec: EmbedderSpec, *, what: str) 
 class SentenceTransformerEmbedder:
     """`sentence-transformers` backend. Needs the `[retrieval]` extra.
 
-    Not exercised in CI - the PR pipeline installs core plus dev only, and this
-    machine has neither torch nor sentence-transformers. The pure parts above
-    are tested; this class is a thin shell over `model.encode` and should stay
-    thin for exactly that reason.
+    The model load is not exercised in CI - the PR pipeline installs core plus
+    dev only. What it does with a loaded model is, against a stand-in with the
+    same `encode`. This class is a thin shell over `model.encode` and should
+    stay thin for exactly that reason.
     """
 
     def __init__(self, spec: EmbedderSpec) -> None:
@@ -170,9 +170,7 @@ class SentenceTransformerEmbedder:
             self._model = SentenceTransformer(self.spec.model_name)  # pragma: no cover
         return self._model  # pragma: no cover - unreachable without the extra
 
-    def _encode(
-        self, texts: Sequence[str]
-    ) -> NDArray[np.float32]:  # pragma: no cover - needs model
+    def _encode(self, texts: Sequence[str], *, progress: bool) -> NDArray[np.float32]:
         model = self._load()
         encode = getattr(model, "encode", None)
         if encode is None:
@@ -181,7 +179,7 @@ class SentenceTransformerEmbedder:
             list(texts),
             batch_size=self.spec.batch_size,
             convert_to_numpy=True,
-            show_progress_bar=False,
+            show_progress_bar=progress,
             normalize_embeddings=False,
         )
         matrix = np.asarray(raw, dtype=np.float32)
@@ -191,11 +189,20 @@ class SentenceTransformerEmbedder:
         return matrix
 
     def encode_passages(self, passages: Sequence[str]) -> NDArray[np.float32]:
-        """Encode passages. No instruction prefix, ever."""
+        """Encode passages. No instruction prefix, ever.
+
+        Shows a progress bar, with rate and ETA, on stderr. Passages are only
+        encoded by an index build, which is one call over the whole corpus and
+        is otherwise silent for as long as it takes.
+        """
         if not passages:
             raise EmbedderError("encode_passages needs at least one passage")
-        return self._encode(passages)
+        return self._encode(passages, progress=True)
 
     def encode_queries(self, queries: Sequence[str]) -> NDArray[np.float32]:
-        """Encode queries, applying the spec's instruction if it has one."""
-        return self._encode(prepare_queries(queries, self.spec))
+        """Encode queries, applying the spec's instruction if it has one.
+
+        Never shows a progress bar: queries are encoded on every search, so a
+        training run would print one per step.
+        """
+        return self._encode(prepare_queries(queries, self.spec), progress=False)

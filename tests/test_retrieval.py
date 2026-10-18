@@ -2,10 +2,11 @@
 
 Core dependencies only - numpy and pydantic. `faiss`, `torch` and
 `sentence-transformers` are in the `[retrieval]` extra, which the PR pipeline
-does not install, so `FaissHnswIndex` and `SentenceTransformerEmbedder` are not
-exercised here. What *is* exercised is everything that decides what the vectors
-mean and whether an index may be used at all, which is where the silent
-failures live.
+does not install, so `FaissHnswIndex` and the model load are not exercised
+here. What *is* exercised is everything that decides what the vectors mean and
+whether an index may be used at all, which is where the silent failures live -
+including what `SentenceTransformerEmbedder` does with a model once it has one,
+against a stand-in.
 """
 
 from __future__ import annotations
@@ -491,6 +492,57 @@ def test_encode_passages_rejects_an_empty_batch() -> None:
     """Checked before the model is touched, so it needs no extra."""
     with pytest.raises(EmbedderError, match="at least one passage"):
         SentenceTransformerEmbedder(_spec()).encode_passages([])
+
+
+class _StandInModel:
+    """`SentenceTransformer.encode`'s shape, returning unnormalised vectors."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def encode(self, texts: list[str], **kwargs: object) -> NDArray[np.float32]:
+        self.calls.append(kwargs)
+        return _vectors(len(texts), normalize=False)
+
+
+def _with_stand_in(
+    spec: EmbedderSpec | None = None,
+) -> tuple[SentenceTransformerEmbedder, _StandInModel]:
+    embedder = SentenceTransformerEmbedder(spec or _spec())
+    model = _StandInModel()
+    embedder._model = model
+    return embedder, model
+
+
+def test_an_index_build_shows_progress_and_a_search_does_not() -> None:
+    """Passages are encoded once, by an index build that runs for hours on a
+    CPU. Queries are encoded on every search, so a bar there would print one
+    per training step."""
+    embedder, model = _with_stand_in()
+    embedder.encode_passages(["a passage"])
+    embedder.encode_queries(["a query"])
+    assert [call["show_progress_bar"] for call in model.calls] == [True, False]
+
+
+def test_the_shell_normalises_what_the_model_returns() -> None:
+    embedder, model = _with_stand_in()
+    matrix = embedder.encode_passages(["one", "two"])
+    assert np.allclose(np.linalg.norm(matrix, axis=1), 1.0)
+    # Normalised here, once, not by the model as well.
+    assert model.calls[0]["normalize_embeddings"] is False
+
+
+def test_an_unnormalised_spec_keeps_the_model_output() -> None:
+    embedder, _ = _with_stand_in(_spec(normalize=False))
+    matrix = embedder.encode_queries(["a query"])
+    assert np.array_equal(matrix, _vectors(1, normalize=False))
+
+
+def test_a_model_without_encode_is_an_error() -> None:
+    embedder = SentenceTransformerEmbedder(_spec())
+    embedder._model = object()
+    with pytest.raises(EmbedderError, match="has no encode method"):
+        embedder.encode_passages(["a passage"])
 
 
 def test_recall_with_an_empty_oracle_is_an_error() -> None:
