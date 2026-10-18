@@ -107,16 +107,32 @@ def test_punctuation_is_not_stripped_from_titles() -> None:
         ("ANALYTICAL ENGINE", "Analytical Engine"),
     ],
 )
-def test_equivalent_titles_share_a_doc_id(left: str, right: str) -> None:
-    assert doc_id_for(left) == doc_id_for(right)
+def test_equivalent_titles_with_the_same_text_share_a_doc_id(left: str, right: str) -> None:
+    assert doc_id_for(left, "Same text.") == doc_id_for(right, "Same text.")
 
 
 def test_different_titles_get_different_ids() -> None:
-    assert doc_id_for("Ada Lovelace") != doc_id_for("Charles Babbage")
+    assert doc_id_for("Ada Lovelace", "Text.") != doc_id_for("Charles Babbage", "Text.")
+
+
+def test_two_versions_of_one_page_are_two_documents() -> None:
+    """The first full build kept one version per title and lost the answering
+    sentence for 6.6% of 2WikiMultihopQA's facts. A version is a document."""
+    assert doc_id_for("Ada Lovelace", "One version.") != doc_id_for(
+        "Ada Lovelace", "Another version."
+    )
+
+
+def test_a_case_collision_between_two_articles_stays_two_documents() -> None:
+    """ "Smash Cut" is a film and "Smash cut" an editing technique. They normalise
+    to one title, and keyed on the title alone they became one document."""
+    film = doc_id_for("Smash Cut", "Smash Cut is a 2009 Canadian horror film.")
+    technique = doc_id_for("Smash cut", "A smash cut is a technique in film.")
+    assert film != technique
 
 
 def test_doc_id_shape() -> None:
-    doc_id = doc_id_for("Ada Lovelace")
+    doc_id = doc_id_for("Ada Lovelace", "Text.")
     assert len(doc_id) == 16
     assert set(doc_id) <= set("0123456789abcdef")
 
@@ -124,7 +140,7 @@ def test_doc_id_shape() -> None:
 @pytest.mark.parametrize("title", ["", "   ", "___"])
 def test_blank_title_cannot_have_an_id(title: str) -> None:
     with pytest.raises(DataError, match="blank title"):
-        doc_id_for(title)
+        doc_id_for(title, "Text.")
 
 
 def test_doc_id_is_stable_across_processes() -> None:
@@ -136,7 +152,10 @@ def test_doc_id_is_stable_across_processes() -> None:
     the run that queries it - and the symptom is an index that returns nothing,
     with no error anywhere.
     """
-    code = "from verisearch.data.build_corpus import doc_id_for; print(doc_id_for('Ada Lovelace'))"
+    code = (
+        "from verisearch.data.build_corpus import doc_id_for; "
+        "print(doc_id_for('Ada Lovelace', 'Text.'))"
+    )
     outputs = set()
     for seed in ("0", "1", "random"):
         env = dict(os.environ, PYTHONHASHSEED=seed)
@@ -148,7 +167,7 @@ def test_doc_id_is_stable_across_processes() -> None:
             env=env,
         )
         outputs.add(result.stdout.strip())
-    assert outputs == {doc_id_for("Ada Lovelace")}
+    assert outputs == {doc_id_for("Ada Lovelace", "Text.")}
 
 
 # ---------------------------------------------------------------------------
@@ -236,22 +255,34 @@ def test_build_deduplicates_across_rows() -> None:
     assert build.n_rows == 2
     assert build.n_paragraphs == 4
     assert len(build.docs) == 2
-    assert build.n_duplicate_titles == 2
-    assert build.n_title_conflicts == 0
+    assert build.n_duplicate_paragraphs == 2
+    assert build.n_extra_versions == 0
 
 
-def test_build_reports_conflicting_text_for_the_same_title() -> None:
-    """HotpotQA ships the same paragraph many times, not always identically.
-
-    A non-zero conflict count means the corpus text depends on row order, so the
-    build is not reproducible from the dataset alone. It must be visible.
-    """
+def test_build_keeps_every_version_of_a_paragraph() -> None:
+    """The same title with different text is two documents, and counted, because
+    several versions of one page can fill a top-k between them."""
     first = {"title": ["T"], "sentences": [["one version."]]}
     second = {"title": ["T"], "sentences": [["a different version."]]}
     build = build_corpus([{"context": first}, {"context": second}], SPEC)
-    assert len(build.docs) == 1
-    assert build.n_title_conflicts == 1
-    assert build.docs[0].text == "one version."
+    assert sorted(doc.text for doc in build.docs) == ["a different version.", "one version."]
+    assert build.n_extra_versions == 1
+    assert build.n_duplicate_paragraphs == 0
+
+
+def test_the_corpus_does_not_depend_on_row_order() -> None:
+    """Keeping the first version seen made the text of a document a function of
+    row order. Now every version is kept and, for identical text under two
+    spellings of a title, the smaller spelling wins - in any order."""
+    rows = [
+        {"context": {"title": ["Ada_Lovelace"], "sentences": [["Same."]]}},
+        {"context": {"title": ["Ada Lovelace"], "sentences": [["Same."]]}},
+        {"context": {"title": ["Ada Lovelace"], "sentences": [["Different."]]}},
+    ]
+    forward = build_corpus(rows, SPEC)
+    backward = build_corpus(list(reversed(rows)), SPEC)
+    assert forward.docs == backward.docs
+    assert {doc.title for doc in forward.docs} == {"Ada Lovelace"}
 
 
 def test_build_skips_empty_paragraphs() -> None:

@@ -32,7 +32,21 @@ from typing import TYPE_CHECKING
 
 from verisearch.config import DEFAULT_CONFIG_PATH, ConfigError, load_config, load_sweep
 from verisearch.data.build_corpus import load_corpus, summarize_corpus
-from verisearch.data.datasets import DataError, Split, load_jsonl, write_jsonl
+from verisearch.data.datasets import (
+    DATASET_SPECS,
+    DataError,
+    Split,
+    load_jsonl,
+    spec_for,
+    write_jsonl,
+)
+from verisearch.data.prepare import (
+    MANIFEST_FILENAME,
+    assemble,
+    download_rows,
+    read_dataset,
+    write_prepared,
+)
 from verisearch.eval.baselines import (
     BaselineKind,
     EvalContext,
@@ -128,6 +142,54 @@ def _load_embedder(spec: EmbedderSpec) -> object:  # pragma: no cover - needs [r
     from verisearch.retrieval.embedder import SentenceTransformerEmbedder
 
     return SentenceTransformerEmbedder(spec)
+
+
+def prepare_data(args: argparse.Namespace) -> int:
+    """`scripts/00_prepare_data.sh`. Download, split, build the corpus, check coverage.
+
+    The step before `01_build_index.sh`, and the only one that needs the
+    network. `--plan` names what would be downloaded and stops before any of
+    it, so it needs neither the network nor the `[data]` extra.
+
+    Exits 1, after writing everything, when a supporting title has no document
+    in the corpus - the files exist for diagnosis, but recall on them is capped
+    and the exit code says so. Same convention as `frontier` and `serve-bench`.
+    """
+    out_dir = Path(args.out)
+    # argparse `choices` has already refused an unknown name.
+    specs = [spec_for(name) for name in args.datasets]
+
+    for spec in specs:
+        name = f"{spec.hf_path}" + (f" ({spec.hf_name})" if spec.hf_name else "")
+        corpus = f"corpus from {spec.context_key!r}" if spec.context_key else "no paragraphs"
+        print(f"{spec.name:<16} {name}  splits {', '.join(spec.hf_splits)}  {corpus}")
+    print(f"seed        {args.seed}")
+    print(f"limit       {args.limit if args.limit is not None else 'none - the full pool'}")
+    print(f"out         {out_dir}")
+
+    if args.plan:
+        print("\nplan only, nothing downloaded or written.")
+        return 0
+    if (out_dir / MANIFEST_FILENAME).exists() and not args.force:
+        return _fail(
+            f"{out_dir} already holds a finished build. Every eval context and index built "
+            f"from it fingerprints these files; pass --force to rebuild anyway."
+        )
+
+    try:
+        parts = [read_dataset(download_rows(spec, args.limit), spec) for spec in specs]
+        prepared = assemble(parts, seed=args.seed, limit=args.limit)
+    except _EXPECTED as exc:
+        return _fail(str(exc))
+
+    print(f"\n{prepared.manifest.summary()}")
+    for path in write_prepared(prepared, out_dir):
+        print(f"wrote {path}")
+
+    problems = prepared.manifest.problems()
+    for problem in problems:
+        print(f"not usable as-is - {problem}", file=sys.stderr)
+    return 1 if problems else 0
 
 
 def build_index(args: argparse.Namespace) -> int:
@@ -521,6 +583,27 @@ def serve_bench(args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
+def _add_prepare_data(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser(
+        "prepare-data", help="download the datasets, split them, and build the corpus"
+    )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=tuple(DATASET_SPECS),
+        default=list(DATASET_SPECS),
+        help="PROJECT.md section 7's four by default, in this order - the order decides "
+        "which text wins when two datasets share a title",
+    )
+    parser.add_argument("--out", default="data/processed")
+    parser.add_argument("--seed", type=int, default=42, help="split seed; configs/base.yaml seed")
+    parser.add_argument(
+        "--limit", type=int, default=None, help="rows per HF split, for a smoke build only"
+    )
+    parser.add_argument("--force", action="store_true", help="overwrite a finished build")
+    parser.set_defaults(handler=prepare_data)
+
+
 def _add_build_index(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser("build-index", help="embed a corpus and build a vector index")
     parser.add_argument("--corpus", required=True, help="corpus JSONL from build_corpus")
@@ -654,6 +737,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="resolve and print what would happen, write nothing",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    _add_prepare_data(subparsers)
     _add_build_index(subparsers)
     _add_eval_context(subparsers)
     _add_eval_report(subparsers)
