@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import urllib.error
 import urllib.request
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
@@ -61,9 +62,9 @@ _FROZEN = ConfigDict(frozen=True, extra="forbid")
 # passage text and covers far more than one GRPO group's worth of queries.
 DEFAULT_CACHE_ENTRIES = 2048
 
-# Socket timeout for `HttpRetriever`, in seconds. Retrieval is a vector search
-# over a few tens of thousands of documents; if it has not answered in ten
-# seconds the service is wedged, not slow.
+# Socket timeout for `HttpRetriever`, in seconds. Retrieval is an HNSW search
+# over under a million documents; if it has not answered in ten seconds the
+# service is wedged, not slow.
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
 # Retries per request. One, not three: the failures this sees are a restarted
@@ -115,6 +116,20 @@ class StoredDoc(BaseModel):
     text: str = Field(min_length=1)
 
 
+def page_key(title: str) -> str:
+    """Which Wikipedia page a document is a version of.
+
+    Underscores and runs of whitespace fold, as they do in `normalize_title`.
+    **Case does not**, which is the difference: "Smash Cut" is a film and
+    "Smash cut" an editing technique, and folding case would hand a query about
+    one only the other. `normalize_title` lowercases because it compares gold
+    titles with retrieved ones, where the datasets disagree about case; this
+    decides which hits are duplicates of each other, where a false merge throws
+    away a different article.
+    """
+    return " ".join(title.replace("_", " ").split())
+
+
 class DocStore(Protocol):
     """Where the join gets its text. Swappable for a database later."""
 
@@ -122,18 +137,26 @@ class DocStore(Protocol):
 
     def __len__(self) -> int: ...
 
+    @property
+    def max_versions_per_page(self) -> int:
+        """The most documents any one page has. See `LocalRetriever`."""
+        ...
+
 
 class InMemoryDocStore:
     """The whole corpus in a dict.
 
-    Sized for this project, not for Wikipedia: the corpus is the union of
-    HotpotQA's own context paragraphs (see `data/build_corpus.py` for why), which
-    is tens of thousands of documents, not millions. If the corpus ever becomes
-    the full abstracts dump this is the class that has to go.
+    Sized for this project, not for Wikipedia: the corpus is the union of the
+    in-distribution datasets' own context paragraphs (see `data/prepare.py`),
+    914,534 documents on the first full build, measured at 1.36 GB held and
+    1.90 GB peak while loading. If the corpus ever becomes the full abstracts
+    dump this is the class that has to go.
     """
 
     def __init__(self, docs: dict[str, StoredDoc]) -> None:
         self._docs = docs
+        pages = Counter(page_key(doc.title) for doc in docs.values())
+        self._max_versions = max(pages.values(), default=1)
 
     @classmethod
     def from_records(cls, records: Iterable[DocRecord]) -> InMemoryDocStore:
@@ -159,6 +182,10 @@ class InMemoryDocStore:
 
     def __len__(self) -> int:
         return len(self._docs)
+
+    @property
+    def max_versions_per_page(self) -> int:
+        return self._max_versions
 
 
 def load_doc_store(path: str | Path) -> InMemoryDocStore:
@@ -206,9 +233,36 @@ class LocalRetriever:
     Construction checks the embedder against the index's recorded fingerprint
     via `check_compatible`, so a mismatch fails here rather than returning
     well-formed nonsense for a whole training run.
+
+    **One passage per page.** The corpus keeps every version of a paragraph
+    (`data/build_corpus.py` explains why - dropping them lost gold evidence),
+    and versions of one page embed almost identically. Left alone, a top-3
+    would often be one article three times: the policy pays for a search and
+    learns one fact, and precision@k counts a gold page more than once. So
+    results are deduplicated by `page_key`, keeping each page's best-scoring
+    version.
+
+    **Exactly k pages, by pigeonhole, not by a tuned over-fetch.** If no page
+    has more than m versions, the top k*m hits hold at least k distinct pages:
+    k-1 pages can account for at most (k-1)*m of them. So the index is asked
+    for `k * docs.max_versions_per_page` hits - 4x on the first full build,
+    where the most versions any page has is 4 - and the guarantee follows from
+    the corpus itself. A constant would be a guess that a rebuilt corpus could
+    silently invalidate, and the symptom would be fewer than k passages, which
+    reads as weak retrieval.
+
+    `one_per_page=False` returns the index's raw top k, versions and all - for
+    analysis, not for training or eval.
     """
 
-    def __init__(self, index: VectorIndex, embedder: QueryEmbedder, docs: DocStore) -> None:
+    def __init__(
+        self,
+        index: VectorIndex,
+        embedder: QueryEmbedder,
+        docs: DocStore,
+        *,
+        one_per_page: bool = True,
+    ) -> None:
         check_compatible(index.meta, embedder.spec)
         if len(docs) < index.meta.n_vectors:
             # Fewer documents than vectors guarantees unresolvable hits. Caught
@@ -221,6 +275,7 @@ class LocalRetriever:
         self._index = index
         self._embedder = embedder
         self._docs = docs
+        self._one_per_page = one_per_page
 
     @property
     def meta(self) -> IndexMeta:
@@ -262,14 +317,16 @@ class LocalRetriever:
         # and loses the rest of the GRPO group with it.
         real = [(position, q) for position, q in enumerate(queries) if q.strip()]
 
+        depth = k * self._docs.max_versions_per_page if self._one_per_page else k
         hit_rows: list[list[IndexHit]] = []
         if real:
             vectors = self._embedder.encode_queries([q for _, q in real])
-            hit_rows = self._index.search(np.asarray(vectors, dtype=np.float32), k)
+            hit_rows = self._index.search(np.asarray(vectors, dtype=np.float32), depth)
 
         results: list[list[Passage]] = [[] for _ in queries]
         for (position, _), hits in zip(real, hit_rows, strict=True):
-            results[position] = self._to_passages(hits)
+            passages = self._to_passages(hits)
+            results[position] = _first_per_page(passages, k) if self._one_per_page else passages
         return results
 
     def _to_passages(self, hits: Sequence[IndexHit]) -> list[Passage]:
@@ -292,6 +349,21 @@ class LocalRetriever:
                 Passage(doc_id=doc.doc_id, title=doc.title, text=doc.text, score=hit.score)
             )
         return passages
+
+
+def _first_per_page(passages: Sequence[Passage], k: int) -> list[Passage]:
+    """The first passage of each page, in rank order, up to k."""
+    seen: set[str] = set()
+    kept: list[Passage] = []
+    for passage in passages:
+        page = page_key(passage.title)
+        if page in seen:
+            continue
+        seen.add(page)
+        kept.append(passage)
+        if len(kept) == k:
+            break
+    return kept
 
 
 class CachingRetriever:
