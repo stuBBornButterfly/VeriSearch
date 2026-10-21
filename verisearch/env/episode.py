@@ -63,12 +63,20 @@ __all__ = [
 
 
 class Generation(BaseModel):
-    """One policy continuation. `token_ids` is empty unless the policy supplies it."""
+    """One policy continuation.
+
+    `token_ids` is empty unless the policy supplies it, and `logprobs` - the
+    sampling log-probability of each of those tokens - is empty unless the
+    backend returns them. vLLM does; a scripted test policy does not. GRPO needs
+    them for the importance-sampling ratio, so `train/rollout.py` requires them
+    and the episode loop does not.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     text: str
     token_ids: tuple[int, ...] = ()
+    logprobs: tuple[float | None, ...] = ()
 
 
 class Policy(Protocol):
