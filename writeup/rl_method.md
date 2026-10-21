@@ -113,6 +113,32 @@ real finding of the spike - choosing TRL removes the GRPO machinery, not the RL 
    in one pass is ~14.6 GB. Log-probs get computed chunked. Arithmetic, not a measurement - the
    1.5B run will settle it.
 
+### The loop, run end to end
+
+`scripts/02_train.sh --smoke --steps 5` - the exact command the nightly `smoke-train` stage
+runs - on Qwen2.5-0.5B with the fake retriever, 2026-10-21:
+
+| | |
+|---|---|
+| verdict | `RESULT: PASS` |
+| final loss | 5.788e-05, finite |
+| mean reward | -0.50 |
+| step time | ~2.2 s |
+| KL from reference | 0.0014 |
+| `reward_std` / `frac_reward_zero_std` | 0 / 1 |
+
+The last row is the interesting one and it is not good news: every rollout hit the no-answer
+penalty and nothing else, so every advantage was zero and the steps moved almost nothing. A
+0.5B policy with a 128-token turn budget never produced a well-formed answer. That is what a
+dead reward looks like, which is exactly what P2's exit criterion exists to rule out at 1.5B -
+so the run proves the wiring, not the method.
+
+Two bugs of mine surfaced only by running it, both written up in
+[`failure_cases.md`](failure_cases.md): generations that parsed to no turns were dropped
+instead of trained on, and the nightly gate failed on its own bookkeeping while the loop was
+fine. Neither was visible from reading the code, which is the argument for running five steps
+before writing five hundred lines more.
+
 ### Hardware this runs on
 
 RTX 5060 Ti 16 GB (Blackwell, cc 12.0), driver 580.173.02, torch 2.13.0+cu130, vLLM 0.27.0,
