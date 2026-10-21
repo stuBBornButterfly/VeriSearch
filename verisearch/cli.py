@@ -79,6 +79,12 @@ from verisearch.serve.server import ServeError
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    import numpy as np
+    from numpy.typing import NDArray
+
+    from verisearch.retrieval.embedder import SentenceTransformerEmbedder
+    from verisearch.retrieval.index import FaissHnswIndex
+
 # PROJECT.md section 5. Repeated here as the CLI default rather than imported
 # from a config section that does not exist yet - `TODO` in index.py tracks
 # moving the retrieval constants into configs/base.yaml.
@@ -132,7 +138,9 @@ def _spec_from_args(args: argparse.Namespace) -> EmbedderSpec:
     )
 
 
-def _load_embedder(spec: EmbedderSpec) -> object:  # pragma: no cover - needs [retrieval]
+def _load_embedder(  # pragma: no cover - needs [retrieval]
+    spec: EmbedderSpec,
+) -> SentenceTransformerEmbedder:
     """Construct the real embedder. The one line in this module that needs torch.
 
     Isolated so that everything above and below it - argument resolution, the
@@ -248,7 +256,7 @@ def _embed_and_save(  # pragma: no cover - needs the [retrieval] extra
     out_dir = Path(args.out)
     try:
         embedder = _load_embedder(spec)
-        vectors = embedder.encode_passages(texts)  # type: ignore[attr-defined]
+        vectors = embedder.encode_passages(texts)
         index = _build(args, vectors, doc_ids, spec)
         index.save(out_dir)
     except _EXPECTED as exc:
@@ -261,22 +269,22 @@ def _embed_and_save(  # pragma: no cover - needs the [retrieval] extra
 
 def _build(  # pragma: no cover - only reached once vectors exist
     args: argparse.Namespace,
-    vectors: object,
+    vectors: NDArray[np.float32],
     doc_ids: list[str],
     spec: EmbedderSpec,
-) -> BruteForceIndex:
+) -> BruteForceIndex | FaissHnswIndex:
     if args.index_type == "hnsw":
         from verisearch.retrieval.index import FaissHnswIndex
 
-        return FaissHnswIndex.build(  # type: ignore[return-value]
-            vectors,  # type: ignore[arg-type]
+        return FaissHnswIndex.build(
+            vectors,
             doc_ids,
             spec,
             m=args.hnsw_m,
             ef_construction=args.ef_construction,
             ef_search=args.ef_search,
         )
-    return BruteForceIndex.build(vectors, doc_ids, spec)  # type: ignore[arg-type]
+    return BruteForceIndex.build(vectors, doc_ids, spec)
 
 
 def eval_context(args: argparse.Namespace) -> int:

@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextvars import ContextVar
 from enum import StrEnum
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -38,6 +39,11 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from pydantic.fields import FieldInfo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "base.yaml"
@@ -294,6 +300,38 @@ class LoggingConfig(BaseModel):
     wandb_entity: str | None = None
 
 
+# The merged YAML of the `load_config` call in progress, read by `_YamlLayer`.
+#
+# Not `Config(**merged)`: the mypy plugin types `__init__` field by field
+# (`init_typed = true`), no `**dict[str, object]` splat can satisfy that, and
+# success criterion 9 allows no `# type: ignore`. Not
+# `Config.model_validate(merged)` either: it skips pydantic-settings' sources,
+# which would silently drop every environment override. Sources are built in a
+# classmethod that takes no per-call arguments, so the YAML reaches its source
+# through this variable, set and reset around a single construction.
+_YAML_LAYER: ContextVar[Mapping[str, object] | None] = ContextVar(
+    "verisearch_yaml_layer", default=None
+)
+
+
+class _YamlLayer(PydanticBaseSettingsSource):
+    """The merged YAML files, as a settings source of their own."""
+
+    def get_field_value(
+        self,
+        field: FieldInfo,  # noqa: ARG002 - signature fixed by pydantic-settings
+        field_name: str,
+    ) -> tuple[object, str, bool]:
+        # Abstract on the base class, but only sources that keep the base
+        # `__call__` use it. This one returns the whole layer at once, as
+        # pydantic-settings' own `DefaultSettingsSource` does.
+        return None, field_name, False  # pragma: no cover - never called
+
+    def __call__(self) -> dict[str, object]:
+        layer = _YAML_LAYER.get()
+        return {} if layer is None else dict(layer)
+
+
 class Config(BaseSettings):
     """The whole experiment, as data.
 
@@ -325,20 +363,30 @@ class Config(BaseSettings):
     @classmethod
     def settings_customise_sources(
         cls,
-        settings_cls: type[BaseSettings],  # noqa: ARG003 - signature fixed by pydantic-settings
+        settings_cls: type[BaseSettings],
         init_settings: PydanticBaseSettingsSource,
         env_settings: PydanticBaseSettingsSource,
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Put the environment ahead of the YAML passed to `__init__`.
+        """Put the environment ahead of the YAML.
 
-        Pydantic's default order puts init kwargs first, which would make a
-        committed YAML file silently beat a machine-specific override. The YAML
-        is the shared experiment definition; the environment is the local
-        deviation from it, so the environment has to win.
+        Pydantic's default order puts init kwargs first. The YAML used to
+        arrive as init kwargs, and that order would have made a committed YAML
+        file silently beat a machine-specific override. The YAML is the shared
+        experiment definition; the environment is the local deviation from it,
+        so the environment has to win.
+
+        The YAML now has its own layer (`_YamlLayer`), directly below init
+        kwargs. `load_config` passes none, so for it the order is unchanged.
         """
-        return (env_settings, dotenv_settings, init_settings, file_secret_settings)
+        return (
+            env_settings,
+            dotenv_settings,
+            init_settings,
+            _YamlLayer(settings_cls),
+            file_secret_settings,
+        )
 
     @property
     def fingerprint(self) -> str:
@@ -422,18 +470,18 @@ def load_config(*paths: str | Path) -> Config:
     for path in targets:
         merged = _deep_merge(merged, _load_yaml(path))
 
+    # The YAML goes in as its own settings source, not as init kwargs - see
+    # `_YAML_LAYER` for why.
+    token = _YAML_LAYER.set(merged)
     try:
-        # mypy cannot match a `**dict[str, object]` splat against a typed
-        # `__init__`, and it has to be a splat: `Config.model_validate(merged)`
-        # bypasses BaseSettings' sources, which would silently drop every
-        # environment override. Pydantic validates all of it at runtime - the
-        # ignore costs no safety, only a static check that cannot be expressed.
-        return Config(**merged)  # type: ignore[arg-type]
+        return Config()
     except ValueError as exc:
         # Pydantic's ValidationError subclasses ValueError. Chaining keeps the
         # per-field detail while giving callers one type to catch.
         joined = ", ".join(str(p) for p in targets)
         raise ConfigError(f"invalid config from [{joined}]:\n{exc}") from exc
+    finally:
+        _YAML_LAYER.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +556,8 @@ def load_sweep(path: str | Path) -> SweepSpec:
     """Read a sweep manifest. Same error contract as `load_config`."""
     target = Path(path)
     try:
-        return SweepSpec(**_load_yaml(target))  # type: ignore[arg-type]
+        # A plain model, not settings: no sources to skip, so validate directly.
+        return SweepSpec.model_validate(_load_yaml(target))
     except ValueError as exc:
         raise ConfigError(f"invalid sweep manifest {target}:\n{exc}") from exc
 
