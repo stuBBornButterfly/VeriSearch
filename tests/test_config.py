@@ -17,6 +17,7 @@ import yaml
 from pydantic import ValidationError
 
 from verisearch.config import (
+    _YAML_LAYER,
     DEFAULT_CONFIG_PATH,
     Config,
     ConfigError,
@@ -245,6 +246,20 @@ def test_environment_beats_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
     """The YAML is the shared experiment; the environment is the local deviation."""
     monkeypatch.setenv("VERISEARCH_RETRIEVAL__SERVICE_URL", "http://10.0.0.5:9000")
     assert load_config().retrieval.service_url == "http://10.0.0.5:9000"
+
+
+def test_the_yaml_layer_does_not_outlive_the_load(
+    base_dict: dict[str, object], write_config: WriteConfig
+) -> None:
+    """`load_config` hands the YAML to its settings source through a context
+    variable. Left set - after a success or a failure - the next construction
+    would quietly read the previous experiment."""
+    load_config()
+    assert _YAML_LAYER.get() is None
+    base_dict["not_a_section"] = 1
+    with pytest.raises(ConfigError):
+        load_config(write_config(base_dict))
+    assert _YAML_LAYER.get() is None
 
 
 # ---------------------------------------------------------------------------
