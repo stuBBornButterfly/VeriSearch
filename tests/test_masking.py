@@ -236,3 +236,26 @@ def test_the_trained_fraction_is_reported_so_a_regression_is_visible() -> None:
     mask = loss_mask(traj)
 
     assert 0.0 < sum(mask) / len(mask) < 1.0
+
+
+def test_a_span_knows_its_length() -> None:
+    traj = _traj()
+
+    assert [span.length for span in spans(traj)] == [TOKENS] * len(spans(traj))
+    assert sum(span.length for span in spans(traj)) == len(completion_token_ids(traj))
+
+
+def test_ids_on_the_injected_turns_only_is_refused() -> None:
+    """The mask would be all zeros and the step would train on nothing, quietly."""
+    traj = _traj()
+    inverted = traj.model_copy(
+        update={
+            "turns": tuple(
+                turn if turn.kind is TurnKind.INFO else turn.model_copy(update={"token_ids": ()})
+                for turn in traj.turns
+            )
+        }
+    )
+
+    with pytest.raises(MaskingError, match="INFO turns only"):
+        loss_mask(inverted)
