@@ -31,6 +31,7 @@ from verisearch.train.grpo import (
     load_questions,
     main,
     rewards_for_trajectories,
+    summarize_history,
 )
 from verisearch.train.masking import completion_token_ids, loss_mask, spans
 from verisearch.train.rollout import (
@@ -525,3 +526,37 @@ def test_an_empty_completion_is_refused_with_our_own_message() -> None:
 
     with pytest.raises(RolloutError, match="empty completion"):
         build_payload(empty, (1, 2), [])
+
+
+def test_the_summary_prefers_the_per_step_loss() -> None:
+    history = [{"loss": 0.4, "reward": -0.5}, {"loss": 0.2, "reward": -0.1}]
+
+    summary = summarize_history(history, 2, Path("out"))
+
+    assert summary.final_loss == pytest.approx(0.2)
+    assert summary.mean_reward == pytest.approx(-0.3)
+    assert summary.loss_is_finite
+
+
+def test_the_summary_falls_back_to_the_final_train_loss() -> None:
+    """A run too short to log a step still has a verdict. The first real smoke
+    run failed its own gate on this: logging_steps defaulted to 500, two steps
+    logged no per-step loss, and an empty history reported NaN while the loop had
+    run fine. A gate that fails for its own bookkeeping is worse than no gate."""
+    history = [{"train_runtime": 6.1, "train_loss": 0.0, "reward": -0.5}]
+
+    summary = summarize_history(history, 2, Path("out"))
+
+    assert summary.final_loss == pytest.approx(0.0)
+    assert summary.loss_is_finite
+    assert summary.mean_reward == pytest.approx(-0.5)
+
+
+def test_a_history_with_nothing_usable_is_nan_not_zero() -> None:
+    """NaN fails the nightly gate, which is the right outcome for a run that
+    reported nothing: section 15 forbids inventing a number, and 0.0 here would
+    be a passing grade nobody measured."""
+    summary = summarize_history([{"epoch": 0.4}], 2, Path("out"))
+
+    assert math.isnan(summary.final_loss)
+    assert summary.loss_is_finite is False

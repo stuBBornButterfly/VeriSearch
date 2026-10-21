@@ -45,7 +45,14 @@ from verisearch.train.rollout import (
 )
 from verisearch.types import Retriever, Trajectory
 
-__all__ = ["TrainError", "TrainSummary", "load_questions", "main", "rewards_for_trajectories"]
+__all__ = [
+    "TrainError",
+    "TrainSummary",
+    "load_questions",
+    "main",
+    "rewards_for_trajectories",
+    "summarize_history",
+]
 
 #: TRL folds our `env_mask` into the loss mask under this key.
 ENV_MASK_KEY = "env_mask"
@@ -244,6 +251,12 @@ def run_training(  # pragma: no cover - needs the [train] extra and a GPU
                 "stop": list(config.env.stop_sequences),
                 "include_stop_str_in_output": True,
             },
+            # Every step, not the transformers default of 500. A smoke run is 5
+            # steps and a dev run 150, so the default logs nothing at all - and
+            # the per-step series in section 9 (reward per component, within-group
+            # std, KL, completion length, searches per rollout) is the only way a
+            # reward hack is visible while it is happening.
+            logging_steps=1,
             seed=config.seed,
             report_to="wandb" if config.logging.wandb_project else "none",
             run_name=f"lambda-{config.reward.lambda_retrieval_cost}",
@@ -311,18 +324,48 @@ def _as_float(value: object) -> float:
     return math.nan
 
 
+def _last(history: Sequence[Mapping[str, object]], key: str) -> float:
+    """The last finite value logged under `key`, or NaN."""
+    values = [_as_float(entry[key]) for entry in history if key in entry]
+    finite = [value for value in values if math.isfinite(value)]
+    return finite[-1] if finite else math.nan
+
+
+def _mean(history: Sequence[Mapping[str, object]], key: str) -> float:
+    values = [_as_float(entry[key]) for entry in history if key in entry]
+    finite = [value for value in values if math.isfinite(value)]
+    return sum(finite) / len(finite) if finite else math.nan
+
+
+def summarize_history(
+    history: Sequence[Mapping[str, object]], max_steps: int, output_dir: Path
+) -> TrainSummary:
+    """Reduce a trainer's log history to the run's verdict.
+
+    Reads the per-step `loss` series when there is one, and falls back to the
+    final `train_loss` summary when the run was too short to log a step.
+
+    The fallback is here because the first real smoke run reported a NaN loss
+    from an empty history and failed its own gate while the loop had in fact run
+    fine: `logging_steps` defaulted to 500, so two steps logged no per-step loss
+    at all. A gate that fails for its own bookkeeping reasons is worse than no
+    gate, because the next person to see it red will stop believing it.
+    """
+    final_loss = _last(history, "loss")
+    if not math.isfinite(final_loss):
+        final_loss = _last(history, "train_loss")
+    return TrainSummary(
+        steps=max_steps,
+        final_loss=final_loss,
+        mean_reward=_mean(history, "reward"),
+        output_dir=str(output_dir),
+    )
+
+
 def _summarize(  # pragma: no cover - needs a finished trainer
     trainer: _Trainer, max_steps: int, output_dir: Path
 ) -> TrainSummary:
-    history = [entry for entry in trainer.state.log_history if "loss" in entry]
-    rewards = [_as_float(entry["reward"]) for entry in history if "reward" in entry]
-    finite_rewards = [value for value in rewards if math.isfinite(value)]
-    return TrainSummary(
-        steps=max_steps,
-        final_loss=_as_float(history[-1]["loss"]) if history else math.nan,
-        mean_reward=(sum(finite_rewards) / len(finite_rewards) if finite_rewards else math.nan),
-        output_dir=str(output_dir),
-    )
+    return summarize_history(trainer.state.log_history, max_steps, output_dir)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
