@@ -211,6 +211,19 @@ def build_payload(
         mask.extend([POLICY_TOKEN] * len(turn.token_ids))
         logprobs.extend(record.logprobs)
 
+    if not completion:
+        # TRL indexes `ids[-1]` on every completion to decide whether it was
+        # truncated (`grpo_trainer.py:2325`), so an empty one is an IndexError
+        # inside the trainer rather than a bad rollout here. The episode loop
+        # keeps even an unparseable generation, so reaching this means the
+        # generator produced no tokens at all - a misconfiguration, not a
+        # policy behaviour.
+        msg = (
+            f"trajectory {trajectory.question_id} has an empty completion: the generator "
+            "returned no tokens for any turn, so there is nothing to train on"
+        )
+        raise RolloutError(msg)
+
     _check_against_masking(trajectory, completion, mask)
     return RolloutPayload(
         trajectory=trajectory,

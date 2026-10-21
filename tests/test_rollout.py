@@ -20,12 +20,14 @@ import pytest
 
 from verisearch.config import PenaltyConfig, RewardConfig
 from verisearch.env.episode import EpisodeConfig, Generation, Question
+from verisearch.env.protocol import render_prompt
 from verisearch.rewards.compose import RewardSpec
 from verisearch.testing import DEFAULT_CORPUS, FakeRetriever, make_trajectory
 from verisearch.train.grpo import (
     TrainError,
     TrainSummary,
     _as_float,
+    _question_for,
     load_questions,
     main,
     rewards_for_trajectories,
@@ -494,3 +496,32 @@ def test_a_log_entry_that_is_not_a_number_becomes_nan(
         assert math.isnan(result)
     else:
         assert result == pytest.approx(expected)
+
+
+def test_a_prompt_maps_to_exactly_one_question() -> None:
+    """Rollouts are matched to their gold answers by the rendered prompt. A
+    near-miss would score a rollout against another question's answers and
+    nothing would raise, so the lookup is exact."""
+    questions = [
+        Question(question_id="a", question="Who wrote it?", gold_answers=("Ada",)),
+        Question(question_id="b", question="Who wrote it, really?", gold_answers=("Grace",)),
+    ]
+    by_prompt = {render_prompt(q.question, search_budget=2, top_k=2): q for q in questions}
+
+    for question in questions:
+        prompt = render_prompt(question.question, search_budget=2, top_k=2)
+        assert _question_for(prompt, by_prompt).question_id == question.question_id
+
+
+def test_an_unknown_prompt_is_refused() -> None:
+    with pytest.raises(TrainError, match="not one this run rendered"):
+        _question_for("something else entirely", {})
+
+
+def test_an_empty_completion_is_refused_with_our_own_message() -> None:
+    """Rather than an IndexError from inside TRL, which is where this surfaced."""
+    traj = make_trajectory(searches=(), answer=None, tokens_per_turn=0)
+    empty = traj.model_copy(update={"turns": ()})
+
+    with pytest.raises(RolloutError, match="empty completion"):
+        build_payload(empty, (1, 2), [])

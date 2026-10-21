@@ -35,7 +35,7 @@ from pydantic import BaseModel, ConfigDict
 
 from verisearch.config import Config, load_config
 from verisearch.env.episode import EpisodeConfig, Question
-from verisearch.env.protocol import check_stop_sequences
+from verisearch.env.protocol import check_stop_sequences, render_prompt
 from verisearch.rewards.compose import RewardSpec, compose_reward
 from verisearch.train.rollout import (
     TokenGenerator,
@@ -183,9 +183,23 @@ def run_training(  # pragma: no cover - needs the [train] extra and a GPU
 
     # Rollout: TRL hands us the prompts for this step, already repeated
     # num_generations times, and expects token ids back.
+    # Keyed on the rendered prompt, which is exactly what the dataset holds:
+    # with `rollout_func`, TRL forwards the dataset's prompts unchanged
+    # (`grpo_trainer.py:2239`). Matching on a substring instead would let two
+    # questions that share a prefix swap rollouts, and the reward would then be
+    # scored against the wrong gold answers - wrong, and silent.
+    by_prompt = {
+        render_prompt(
+            question.question,
+            search_budget=config.env.search_budget,
+            top_k=config.retrieval.top_k,
+        ): question
+        for question in questions
+    }
+
     def rollout_func(prompts: list[str], trainer: _GeneratorHolder) -> dict[str, object]:
         generator = trainer.vllm_generation
-        batch = [questions[_question_index(prompt, questions)] for prompt in prompts]
+        batch = [_question_for(prompt, by_prompt) for prompt in prompts]
         payloads = rollout_group(
             batch,
             retriever,
@@ -253,22 +267,27 @@ def run_training(  # pragma: no cover - needs the [train] extra and a GPU
     return _summarize(trainer, max_steps, output_dir)
 
 
-def _question_index(  # pragma: no cover - exercised through run_training
-    prompt: str, questions: Sequence[Question]
-) -> int:
-    for index, question in enumerate(questions):
-        if question.question in prompt:
-            return index
-    msg = "a prompt TRL passed to rollout_func matches no question in the dataset"
-    raise TrainError(msg)
+def _question_for(prompt: str, by_prompt: Mapping[str, Question]) -> Question:
+    """The question a prompt came from. Exact match, or fail.
+
+    A near-miss here is the worst kind of bug this file can have: the rollout
+    would be scored against another question's gold answers, every metric would
+    look plausible, and nothing would raise.
+    """
+    question = by_prompt.get(prompt)
+    if question is None:
+        msg = (
+            "a prompt TRL passed to rollout_func is not one this run rendered, so the rollout "
+            "cannot be matched to its gold answers"
+        )
+        raise TrainError(msg)
+    return question
 
 
 def _dataset(  # pragma: no cover - needs the [train] extra
     questions: Sequence[Question], config: Config
 ) -> object:
     datasets = _module("datasets")
-    from verisearch.env.protocol import render_prompt
-
     return datasets.Dataset.from_dict(
         {
             "prompt": [

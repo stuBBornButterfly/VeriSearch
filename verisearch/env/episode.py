@@ -164,7 +164,7 @@ def run_episode(
         # turns carry text only. Attaching the ids to the acting turn keeps the
         # completion reconstructable in order without claiming a per-turn split
         # the policy never gave us.
-        turns.extend(_with_ids(parsed.turns, generation.token_ids))
+        turns.extend(_with_ids(parsed.turns, generation))
 
         if parsed.fatal:
             termination = Termination.PARSE_ERROR
@@ -210,12 +210,37 @@ def run_episode(
     )
 
 
-def _with_ids(turns: Sequence[Turn], token_ids: tuple[int, ...]) -> list[Turn]:
-    """Attach the generation's ids to its last turn, when the policy gave any."""
-    if not token_ids or not turns:
+def _with_ids(turns: Sequence[Turn], generation: Generation) -> list[Turn]:
+    """Attach the generation's ids to its last turn, keeping every token.
+
+    When the generation parsed to no turns at all - bare prose, or a tag the
+    parser refused before any turn closed - the tokens still exist, the policy
+    still wrote them, and they still have to carry loss: a failed attempt is
+    what GRPO needs to push down, and dropping it hands the trainer a rollout
+    with an empty completion. Found by a real smoke run, where TRL indexes
+    `ids[-1]` on every completion (`grpo_trainer.py:2325`) and raised
+    `IndexError` on the first 0.5B rollout that answered in prose.
+
+    Such a generation is recorded as a `THINK` turn: it is something the policy
+    wrote that asked for nothing, `generated` is True so it carries loss, and
+    `Trajectory.parse_failure` says why it went nowhere. A dedicated
+    `TurnKind.UNPARSED` would read better in the failure breakdown, but
+    `TurnKind` is the shared contract - raised on #27 rather than changed here.
+    """
+    if not turns:
+        if not generation.text and not generation.token_ids:
+            return []
+        return [
+            Turn(
+                kind=TurnKind.THINK,
+                text=generation.text,
+                token_ids=generation.token_ids,
+            )
+        ]
+    if not generation.token_ids:
         return list(turns)
     *earlier, acting = turns
-    return [*earlier, acting.model_copy(update={"token_ids": token_ids})]
+    return [*earlier, acting.model_copy(update={"token_ids": generation.token_ids})]
 
 
 def _info_turn(passages: Sequence[Passage], tokenizer: Tokenizer | None) -> Turn:

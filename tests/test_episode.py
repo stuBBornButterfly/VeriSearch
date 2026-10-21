@@ -362,3 +362,33 @@ def test_episode_config_comes_from_the_yaml() -> None:
     # matters lives in `check_stop_sequences`, tested in `test_protocol.py`, and
     # `run_episode` calls it before generating a single token.
     assert from_yaml.stop_sequences == load_config().env.stop_sequences
+
+
+def test_a_generation_that_parses_to_no_turns_still_keeps_its_tokens() -> None:
+    """Found by a real smoke run: a 0.5B policy answered in bare prose, the
+    generation parsed to no turns, its ids were attached to nothing, and TRL
+    raised IndexError on an empty completion (`grpo_trainer.py:2325`).
+
+    Those tokens are what GRPO has to push down, so they carry loss. The turn is
+    recorded as THINK - something the policy wrote that asked for nothing - and
+    `parse_failure` says why it went nowhere.
+    """
+    policy = ScriptedPolicy("Ada Lovelace, I think.", token_ids_per_turn=4)
+
+    traj = run_episode(QUESTION, policy, FakeRetriever(), config(), tokenizer=CountingTokenizer())
+
+    assert traj.termination is Termination.PARSE_ERROR
+    assert traj.parse_failure is ParseFailure.NO_ANSWER
+    assert [t.kind for t in traj.turns] == [TurnKind.THINK]
+    assert traj.turns[0].text == "Ada Lovelace, I think."
+    assert traj.turns[0].token_ids == (100, 101, 102, 103)
+    assert traj.turns[0].generated is True
+
+
+def test_a_generation_with_no_text_and_no_tokens_adds_no_turn() -> None:
+    """The degenerate case stays empty rather than becoming a blank turn; the
+    rollout builder refuses it with its own message."""
+    traj = run_episode(QUESTION, ScriptedPolicy(""), FakeRetriever(), config())
+
+    assert traj.turns == ()
+    assert traj.termination is Termination.PARSE_ERROR
