@@ -29,11 +29,12 @@ Owner: Ayesha.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from verisearch.types import Passage
+from verisearch.types import Passage, Retriever
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -141,17 +142,35 @@ class HealthResponse(BaseModel):
 
 
 class BatchRetriever(Protocol):
-    """A retriever that can answer several queries in one index call.
+    """What this service needs from a retriever, which is now all of `Retriever`.
 
-    `client.LocalRetriever` satisfies this. `types.Retriever` deliberately does
-    not include `search_batch` - see the open DECIDE there - so the service asks
-    for the wider interface rather than widening the shared contract to suit
-    one caller.
+    Kept as its own name rather than importing `types.Retriever`, because the
+    two are not the same statement: `Retriever` is the contract both halves of
+    the project agreed, and this is what one HTTP service happens to call. They
+    coincide today. If the shared protocol grows a method the service does not
+    use, this one should not grow with it.
+
+    `queries: Sequence[str]`, not `list[str]`: with `list` a `types.Retriever`
+    would *not* satisfy this protocol, which would be a surprising thing for the
+    retrieval service to say about the project's own retriever.
     """
 
     def search(self, query: str, k: int) -> list[Passage]: ...
 
-    def search_batch(self, queries: list[str], k: int) -> list[list[Passage]]: ...
+    def search_batch(self, queries: Sequence[str], k: int) -> list[list[Passage]]: ...
+
+
+def batch_witness(retriever: Retriever) -> BatchRetriever:
+    """Any `types.Retriever` is a `BatchRetriever`. Checked by mypy, not asserted.
+
+    This is the claim that justified widening `search_batch` here from
+    `list[str]` to `Sequence[str]`, and it is the kind of claim that quietly
+    stops being true. `tests/` is outside mypy's `files` list, so writing it as
+    a test assertion would mean writing something that can never fail; the
+    return annotation here is what notices if the two protocols drift apart.
+    The test that calls this function is what keeps it from being dead code.
+    """
+    return retriever
 
 
 def _check_k(k: int) -> None:

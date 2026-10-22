@@ -420,3 +420,47 @@ def test_punctuation_only_sentences_are_not_claims(fake_scorer: FakeFaithfulness
     )
     assert len(result.claims) == 1
     assert result.unsupported_rate == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# FakeRetriever.search_batch - the protocol grew, so the fake did
+# ---------------------------------------------------------------------------
+
+
+def test_the_fake_batches_in_order_and_agrees_with_search(
+    fake_retriever: FakeRetriever,
+) -> None:
+    """A fake that disagreed with the real retriever on ordering would let the
+    episode loop pass its tests and mis-attribute passages against the service."""
+    queries = ["Analytical Engine", "Ada Lovelace", "nothing relevant here"]
+
+    batched = fake_retriever.search_batch(queries, 2)
+    fake_retriever.calls.clear()
+    looped = [fake_retriever.search(query, 2) for query in queries]
+
+    assert [[p.doc_id for p in row] for row in batched] == [
+        [p.doc_id for p in row] for row in looped
+    ]
+
+
+def test_the_fake_records_every_query_in_a_batch(fake_retriever: FakeRetriever) -> None:
+    """`calls` is how a test asserts the episode loop batched rather than looped."""
+    fake_retriever.search_batch(["one", "two"], 3)
+    assert fake_retriever.calls == [("one", 3), ("two", 3)]
+
+
+@pytest.mark.parametrize(
+    ("queries", "k"),
+    [
+        pytest.param(["a"], 0, id="zero-k"),
+        pytest.param(["a"], -1, id="negative-k"),
+        pytest.param([], 1, id="no-queries"),
+    ],
+)
+def test_the_fake_refuses_bad_batch_input(
+    fake_retriever: FakeRetriever, queries: list[str], k: int
+) -> None:
+    """Loud in the fake, so a caller bug is found in a unit test rather than
+    against a live service at group 8."""
+    with pytest.raises(ValueError, match=r"k must be positive|at least one query"):
+        fake_retriever.search_batch(queries, k)

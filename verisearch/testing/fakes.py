@@ -171,6 +171,23 @@ class FakeRetriever:
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [passage.model_copy(update={"score": score}) for score, _, passage in scored[:k]]
 
+    def search_batch(self, queries: Sequence[str], k: int) -> list[list[Passage]]:
+        """Each query, in order. Records every call, same as `search`.
+
+        A loop, deliberately. The real `LocalRetriever` batches because its
+        index does; a fake that invented batching machinery would be testing the
+        fake. What it must share with the real one is the contract - same order
+        out as in, same loud failure on a bad `k`, and every call recorded so a
+        test can assert the episode loop batched rather than looped.
+        """
+        if k <= 0:
+            msg = f"k must be positive, got {k}"
+            raise ValueError(msg)
+        if not queries:
+            msg = "search_batch needs at least one query"
+            raise ValueError(msg)
+        return [self.search(query, k) for query in queries]
+
     @staticmethod
     def _overlap(query_tokens: frozenset[str], passage: Passage) -> float:
         if not query_tokens:

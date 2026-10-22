@@ -243,10 +243,9 @@ class LocalRetriever:
     def search_batch(self, queries: Sequence[str], k: int) -> list[list[Passage]]:
         """Several queries in one index call.
 
-        Not part of the `Retriever` protocol - `types.py` proposes staying sync
-        and single-query until profiling says otherwise. It exists anyway
+        Part of the `Retriever` protocol as of #2. It existed before that
         because the index is already batched, so this is a loop rather than new
-        machinery; if P3 profiling does say retrieval is the bottleneck, adding
+        machinery; the decision to widen the contract was cheap precisely because
         `search_batch` to the protocol becomes a signature change with no
         implementation behind it.
         """
@@ -334,13 +333,56 @@ class CachingRetriever:
         # Deliberately outside any try/except: a retrieval error must not be
         # cached, and must not be swallowed into an empty result either.
         passages = self._inner.search(query, k)
-        if len(self._cache) >= self._max_entries:
-            # Insertion-ordered dict, so this evicts the oldest entry. FIFO
-            # rather than LRU: queries in a training run do not recur in a
-            # pattern that LRU would exploit, and FIFO has no bookkeeping.
-            del self._cache[next(iter(self._cache))]
-        self._cache[key] = tuple(passages)
+        # Insertion-ordered dict, so `_store` evicts the oldest entry. FIFO
+        # rather than LRU: queries in a training run do not recur in a pattern
+        # that LRU would exploit, and FIFO has no bookkeeping.
+        self._store(query, k, passages)
         return passages
+
+    def search_batch(self, queries: Sequence[str], k: int) -> list[list[Passage]]:
+        """Serve what is cached, fetch the rest in one call.
+
+        This is the method that makes the cache worth putting in front of a
+        batching retriever rather than behind it. A GRPO group opens with eight
+        rollouts asking near-identical questions, so a batch typically contains
+        a few distinct queries repeated - looping `search` would serve the
+        repeats from memory but still issue one round trip per distinct miss,
+        and `inner.search_batch` issues one for all of them.
+
+        Misses are de-duplicated before the inner call, so two rollouts that
+        independently invent the same new query cost one lookup, not two.
+        """
+        if k <= 0:
+            raise RetrievalError(f"k must be positive, got {k}")
+        if not queries:
+            raise RetrievalError("search_batch needs at least one query")
+
+        results: list[list[Passage]] = [[] for _ in queries]
+        wanted: dict[str, list[int]] = {}
+        for position, query in enumerate(queries):
+            cached = self._cache.get((query, k))
+            if cached is not None:
+                self.hits += 1
+                results[position] = list(cached)
+            else:
+                self.misses += 1
+                wanted.setdefault(query, []).append(position)
+
+        if wanted:
+            # Outside any try/except, as in `search`: an error must not be
+            # cached and must not become an empty result.
+            fetched = self._inner.search_batch(list(wanted), k)
+            for query, passages in zip(wanted, fetched, strict=True):
+                self._store(query, k, passages)
+                for position in wanted[query]:
+                    results[position] = list(passages)
+        return results
+
+    def _store(self, query: str, k: int, passages: list[Passage]) -> None:
+        """One cache write, with the FIFO eviction `search` documents."""
+        if len(self._cache) >= self._max_entries:
+            del self._cache[next(iter(self._cache))]
+        self._cache[(query, k)] = tuple(passages)
 
 
 class Transport(Protocol):
