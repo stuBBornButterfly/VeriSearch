@@ -69,7 +69,16 @@ plugins = ["pydantic.mypy"]
 files = ["verisearch"]
 
 [[tool.mypy.overrides]]
-module = ["faiss.*", "vllm.*", "peft.*", "sentence_transformers.*"]
+# Optional extras. None of these are installed by the PR pipeline, so mypy must
+# not require their stubs. One entry per line to keep merges from colliding.
+module = [
+    "faiss.*",
+    "vllm.*",
+    "peft.*",
+    "sentence_transformers.*",
+    "transformers.*",
+    "torch.*",
+]
 ignore_missing_imports = true
 
 [tool.pydantic-mypy]
