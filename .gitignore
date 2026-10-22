@@ -21,6 +21,8 @@ venv/
 .coverage.*
 coverage.xml
 htmlcov/
+# JUnit XML written by the unit and integration stages (Jenkinsfile).
+reports/
 
 # Project artifacts (large, regenerated, never committed)
 data/raw/
