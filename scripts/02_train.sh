@@ -72,19 +72,34 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Which interpreter. Jenkins calls this script with `bash`, not `uv run`, so a
-# bare `python` depends on whatever the agent happens to have activated. Prefer
-# the project venv when it is there, and let PYTHON override.
-PYTHON="${PYTHON:-}"
-if [[ -z "${PYTHON}" ]]; then
-  if [[ -x .venv/bin/python ]]; then
-    PYTHON=.venv/bin/python
+# Which interpreter runs the trainer.
+#
+# Jenkins calls this script with `bash`, not `uv run`, so a bare `python` is
+# whatever the agent happens to have on PATH - not necessarily the interpreter
+# the project was installed into. The order: PYTHON if the caller set it, then
+# the project venv, then `python`, then `python3`.
+#
+# The venv is found from this file's location rather than the working directory,
+# and both layouts are checked: `bin/python` on Linux and macOS,
+# `Scripts/python.exe` on Windows, which is where `uv venv` puts it on the
+# Jenkins laptop. Both points are Ayesha's, on #33.
+#
+# #33 adds `scripts/_python.sh` with exactly this logic, sourced by her five
+# scripts. Once it is on `main` this block becomes `source _python.sh` - it is
+# inlined only because that file is not on this branch yet.
+_verisearch_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -z "${PYTHON:-}" ]]; then
+  if [[ -x "${_verisearch_root}/.venv/bin/python" ]]; then
+    PYTHON="${_verisearch_root}/.venv/bin/python"
+  elif [[ -x "${_verisearch_root}/.venv/Scripts/python.exe" ]]; then
+    PYTHON="${_verisearch_root}/.venv/Scripts/python.exe"
   elif command -v python >/dev/null 2>&1; then
     PYTHON=python
   else
     PYTHON=python3
   fi
 fi
+unset _verisearch_root
 
 CONFIG_ARGS=()
 for path in ${CONFIGS}; do

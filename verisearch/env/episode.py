@@ -221,18 +221,19 @@ def _with_ids(turns: Sequence[Turn], generation: Generation) -> list[Turn]:
     `ids[-1]` on every completion (`grpo_trainer.py:2325`) and raised
     `IndexError` on the first 0.5B rollout that answered in prose.
 
-    Such a generation is recorded as a `THINK` turn: it is something the policy
-    wrote that asked for nothing, `generated` is True so it carries loss, and
-    `Trajectory.parse_failure` says why it went nowhere. A dedicated
-    `TurnKind.UNPARSED` would read better in the failure breakdown, but
-    `TurnKind` is the shared contract - raised on #27 rather than changed here.
+    Such a generation is recorded as `TurnKind.UNPARSED`: `generated` is True, so
+    it carries loss, and `Trajectory.parse_failure` says why it went nowhere.
+    Asked for on #2 and now in the frozen contract. Recorded as `THINK` - which
+    is what this did before the contract gained the kind - a dump would read
+    "reasoned and gave up" where the policy ignored the format, and section 15
+    has those dumps read by eye.
     """
     if not turns:
         if not generation.text and not generation.token_ids:
             return []
         return [
             Turn(
-                kind=TurnKind.THINK,
+                kind=TurnKind.UNPARSED,
                 text=generation.text,
                 token_ids=generation.token_ids,
             )

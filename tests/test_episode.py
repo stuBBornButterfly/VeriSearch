@@ -369,9 +369,10 @@ def test_a_generation_that_parses_to_no_turns_still_keeps_its_tokens() -> None:
     generation parsed to no turns, its ids were attached to nothing, and TRL
     raised IndexError on an empty completion (`grpo_trainer.py:2325`).
 
-    Those tokens are what GRPO has to push down, so they carry loss. The turn is
-    recorded as THINK - something the policy wrote that asked for nothing - and
-    `parse_failure` says why it went nowhere.
+    Those tokens are what GRPO has to push down, so they carry loss. The kind is
+    `UNPARSED` rather than `THINK` (asked for on #2, now in the contract): a dump
+    has to show that the policy ignored the format, not that it reasoned and gave
+    up, because section 15 has those dumps read by eye.
     """
     policy = ScriptedPolicy("Ada Lovelace, I think.", token_ids_per_turn=4)
 
@@ -379,7 +380,7 @@ def test_a_generation_that_parses_to_no_turns_still_keeps_its_tokens() -> None:
 
     assert traj.termination is Termination.PARSE_ERROR
     assert traj.parse_failure is ParseFailure.NO_ANSWER
-    assert [t.kind for t in traj.turns] == [TurnKind.THINK]
+    assert [t.kind for t in traj.turns] == [TurnKind.UNPARSED]
     assert traj.turns[0].text == "Ada Lovelace, I think."
     assert traj.turns[0].token_ids == (100, 101, 102, 103)
     assert traj.turns[0].generated is True
