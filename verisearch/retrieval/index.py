@@ -157,6 +157,17 @@ class VectorIndex(Protocol):
     def search(self, queries: NDArray[np.float32], k: int) -> list[list[IndexHit]]: ...
 
 
+class PersistentIndex(VectorIndex, Protocol):
+    """A `VectorIndex` that can write itself to disk. What `build-index` returns.
+
+    Kept apart from `VectorIndex` because the retrieval client only ever reads
+    an index; saving is the build's concern. A third implementation satisfies
+    this structurally, so `cli._build` does not grow a union per index type.
+    """
+
+    def save(self, directory: str | Path) -> None: ...
+
+
 def _validate_build_inputs(
     vectors: NDArray[np.float32],
     doc_ids: Sequence[str],

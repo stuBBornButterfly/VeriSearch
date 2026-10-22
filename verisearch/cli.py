@@ -83,7 +83,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from verisearch.retrieval.embedder import SentenceTransformerEmbedder
-    from verisearch.retrieval.index import FaissHnswIndex
+    from verisearch.retrieval.index import PersistentIndex
 
 # PROJECT.md section 5. Repeated here as the CLI default rather than imported
 # from a config section that does not exist yet - `TODO` in index.py tracks
@@ -272,7 +272,7 @@ def _build(  # pragma: no cover - only reached once vectors exist
     vectors: NDArray[np.float32],
     doc_ids: list[str],
     spec: EmbedderSpec,
-) -> BruteForceIndex | FaissHnswIndex:
+) -> PersistentIndex:
     if args.index_type == "hnsw":
         from verisearch.retrieval.index import FaissHnswIndex
 

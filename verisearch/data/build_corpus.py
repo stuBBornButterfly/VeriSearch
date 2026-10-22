@@ -136,6 +136,10 @@ def doc_id_for(title: str, text: str) -> str:
     A hash, stable across runs, processes and machines, which `hash()` is not:
     Python randomises string hashing per process unless `PYTHONHASHSEED` is
     set, and the Jenkins pipeline deliberately leaves it unset.
+
+    Nothing positional goes in - no row number, no shard, no download order -
+    so the order the datasets arrive in cannot change an id. The index
+    fingerprint and every passage a trajectory cites rely on that.
     """
     canonical = normalize_title(title)
     if not canonical:
