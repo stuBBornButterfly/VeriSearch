@@ -259,3 +259,23 @@ def test_ids_on_the_injected_turns_only_is_refused() -> None:
 
     with pytest.raises(MaskingError, match="INFO turns only"):
         loss_mask(inverted)
+
+
+def test_an_unparsed_turn_carries_loss() -> None:
+    """`UNPARSED` is the policy's own text, so it trains like any other policy
+    turn - only `INFO` is masked out. If this ever flipped, the one behaviour
+    GRPO most needs to push down would stop being learnable."""
+    traj = _traj()
+    with_prose = traj.model_copy(
+        update={
+            "turns": (
+                Turn(kind=TurnKind.UNPARSED, text="Ada Lovelace, I think.", token_ids=(7, 8, 9)),
+                *traj.turns,
+            )
+        }
+    )
+
+    mask = loss_mask(with_prose)
+
+    assert mask[:3] == (POLICY_TOKEN,) * 3
+    assert spans(with_prose)[0].generated is True

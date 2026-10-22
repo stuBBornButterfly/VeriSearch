@@ -63,12 +63,20 @@ __all__ = [
 
 
 class Generation(BaseModel):
-    """One policy continuation. `token_ids` is empty unless the policy supplies it."""
+    """One policy continuation.
+
+    `token_ids` is empty unless the policy supplies it, and `logprobs` - the
+    sampling log-probability of each of those tokens - is empty unless the
+    backend returns them. vLLM does; a scripted test policy does not. GRPO needs
+    them for the importance-sampling ratio, so `train/rollout.py` requires them
+    and the episode loop does not.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     text: str
     token_ids: tuple[int, ...] = ()
+    logprobs: tuple[float | None, ...] = ()
 
 
 class Policy(Protocol):
@@ -156,7 +164,7 @@ def run_episode(
         # turns carry text only. Attaching the ids to the acting turn keeps the
         # completion reconstructable in order without claiming a per-turn split
         # the policy never gave us.
-        turns.extend(_with_ids(parsed.turns, generation.token_ids))
+        turns.extend(_with_ids(parsed.turns, generation))
 
         if parsed.fatal:
             termination = Termination.PARSE_ERROR
@@ -202,12 +210,38 @@ def run_episode(
     )
 
 
-def _with_ids(turns: Sequence[Turn], token_ids: tuple[int, ...]) -> list[Turn]:
-    """Attach the generation's ids to its last turn, when the policy gave any."""
-    if not token_ids or not turns:
+def _with_ids(turns: Sequence[Turn], generation: Generation) -> list[Turn]:
+    """Attach the generation's ids to its last turn, keeping every token.
+
+    When the generation parsed to no turns at all - bare prose, or a tag the
+    parser refused before any turn closed - the tokens still exist, the policy
+    still wrote them, and they still have to carry loss: a failed attempt is
+    what GRPO needs to push down, and dropping it hands the trainer a rollout
+    with an empty completion. Found by a real smoke run, where TRL indexes
+    `ids[-1]` on every completion (`grpo_trainer.py:2325`) and raised
+    `IndexError` on the first 0.5B rollout that answered in prose.
+
+    Such a generation is recorded as `TurnKind.UNPARSED`: `generated` is True, so
+    it carries loss, and `Trajectory.parse_failure` says why it went nowhere.
+    Asked for on #2 and now in the frozen contract. Recorded as `THINK` - which
+    is what this did before the contract gained the kind - a dump would read
+    "reasoned and gave up" where the policy ignored the format, and section 15
+    has those dumps read by eye.
+    """
+    if not turns:
+        if not generation.text and not generation.token_ids:
+            return []
+        return [
+            Turn(
+                kind=TurnKind.UNPARSED,
+                text=generation.text,
+                token_ids=generation.token_ids,
+            )
+        ]
+    if not generation.token_ids:
         return list(turns)
     *earlier, acting = turns
-    return [*earlier, acting.model_copy(update={"token_ids": token_ids})]
+    return [*earlier, acting.model_copy(update={"token_ids": generation.token_ids})]
 
 
 def _info_turn(passages: Sequence[Passage], tokenizer: Tokenizer | None) -> Turn:
