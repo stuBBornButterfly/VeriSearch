@@ -51,6 +51,15 @@ train = [
     "vllm>=0.5",
     "datasets>=2.20",
     "wandb>=0.17",
+    # Pinned to a minor, not a major. The P1 spike (#19) chose TRL's
+    # `GRPOTrainer(rollout_func=...)`, and the masking guarantee rides on an
+    # internal: TRL folds our `env_mask` into `loss_mask = completion_mask *
+    # tool_mask`. That is behaviour cited by line number, not a documented API,
+    # so a minor bump can move it without a changelog entry - and PROJECT.md
+    # section 5 calls unmasked `<info>` tokens invisible in training curves.
+    # Widen this only in a PR where `tests/test_masking.py` passed against the
+    # new version first.
+    "trl>=1.13,<1.14",
 ]
 
 [tool.hatch.build.targets.wheel]
