@@ -39,10 +39,18 @@ faithfulness:
 env:
   search_budget: 4
   max_turns: 6
+  # Per generate() call, not per episode. The total across turns is enforced by
+  # the episode loop against max_turns.
   max_new_tokens: 512
+  # `</search>` only, deliberately. Stopping on `</answer>` too would end a
+  # successful episode on a non-EOS token, and TRL marks a completion truncated
+  # when its last token is not EOS or pad - so every episode that worked would
+  # be reported as clipped, and `mask_truncated_completions=True` would zero the
+  # loss on exactly those rollouts. Finding from the P1 spike (#19), measured in
+  # outputs/smoke_0.5b.log. Letting the model's own EOS end the answer makes
+  # completions/clipped_ratio mean "never answered", which is worth watching.
   stop_sequences:
     - "</search>"
-    - "</answer>"
 
 reward:
   w_correctness: 1.0

@@ -1,0 +1,32 @@
+# Lambda sweep manifest. Owner: Ayesha.
+#
+# NOT a config overlay - do not pass this to `load_config`. Read it with
+# `load_sweep`, then expand it with `sweep_points`:
+#
+#     from verisearch.config import load_sweep, sweep_points
+#     for point in sweep_points(load_sweep("configs/sweep_lambda.yaml")):
+#         ...  # point.run_name, point.config, point.config.fingerprint
+#
+# The four values are PROJECT.md section 6. `base` is loaded once and varied by
+# `Config.with_lambda`, so the only difference between the four runs is this one
+# float - which is the whole claim the frontier plot makes.
+#
+# Scope note: this is four 3B training runs. If the GPU budget does not stretch
+# that far, cut values from the middle and keep 0.0 and 0.1 - a two-point
+# frontier with the endpoints still shows the trade-off. Dropping 0.0 does not
+# work and `SweepSpec` refuses it: every other point is read relative to the
+# un-penalised run.
+
+name: lambda_frontier
+
+base:
+  - configs/base.yaml
+  - configs/train_3b.yaml
+
+lambdas:
+  - 0.0
+  - 0.02
+  - 0.05
+  - 0.1
+
+output_dir: results/raw/sweep_lambda
