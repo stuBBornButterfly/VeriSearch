@@ -56,6 +56,7 @@ def _trajectory(*turns: Turn, answer: str | None = "Peter Weir") -> Trajectory:
         (TurnKind.THINK, True),
         (TurnKind.SEARCH, True),
         (TurnKind.ANSWER, True),
+        (TurnKind.UNPARSED, True),
         (TurnKind.INFO, False),
     ],
 )
@@ -70,8 +71,35 @@ def test_every_turn_kind_is_covered_by_the_masking_rule() -> None:
     If someone adds a kind and forgets to classify it, the parametrize above
     silently stops being exhaustive. This test fails instead.
     """
-    classified = {TurnKind.THINK, TurnKind.SEARCH, TurnKind.ANSWER, TurnKind.INFO}
+    classified = {
+        TurnKind.THINK,
+        TurnKind.SEARCH,
+        TurnKind.ANSWER,
+        TurnKind.UNPARSED,
+        TurnKind.INFO,
+    }
     assert set(TurnKind) == classified
+
+
+def test_a_generation_that_parsed_to_nothing_is_representable() -> None:
+    """The case UNPARSED exists for: the policy answered in bare prose.
+
+    Its tokens carry loss, it is not counted as a search, and the trajectory
+    says why it went nowhere. Mirrors what the episode loop records on #28.
+    """
+    traj = Trajectory(
+        question_id="hpqa-0003",
+        question="Who directed the film?",
+        gold_answers=("Peter Weir",),
+        turns=(Turn(kind=TurnKind.UNPARSED, text="Peter Weir, I think.", token_ids=(1, 2, 3)),),
+        answer=None,
+        termination=Termination.PARSE_ERROR,
+        parse_failure=ParseFailure.NO_ANSWER,
+    )
+
+    assert traj.turns[0].generated is True
+    assert traj.n_searches == 0
+    assert traj.retrieved_passages == ()
 
 
 # ---------------------------------------------------------------------------

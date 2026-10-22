@@ -30,16 +30,24 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class TurnKind(StrEnum):
     """What produced a turn, and therefore whether it carries loss.
 
-    THINK, SEARCH and ANSWER are emitted by the policy. INFO is injected by the
-    environment after a retrieval call - the policy did not write those tokens.
-    That distinction is the whole of loss masking, so it lives in the type
-    system rather than in a comment inside the rollout loop.
+    THINK, SEARCH, ANSWER and UNPARSED are emitted by the policy. INFO is
+    injected by the environment after a retrieval call - the policy did not
+    write those tokens. That distinction is the whole of loss masking, so it
+    lives in the type system rather than in a comment inside the rollout loop.
     """
 
     THINK = "think"
     SEARCH = "search"
     INFO = "info"
     ANSWER = "answer"
+    # DECIDED: a generation in which the parser found no turn at all - bare
+    # prose, which a small policy writes early in training. Dhrubo's request, on
+    # #2, from the first GRPO runs (#31; case 1 in `failure_cases.md`). The
+    # tokens exist and carry loss, because a failed attempt is what GRPO pushes
+    # down. It is not THINK: recorded as one, the trajectory dump reads
+    # "reasoned and gave up" where the policy ignored the format, and section 15
+    # has those dumps read by eye.
+    UNPARSED = "unparsed"
 
 
 class Termination(StrEnum):
