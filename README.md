@@ -149,7 +149,7 @@ reading-and-API exercise, not a training run.
 
 | Option | Cost | Notes |
 |---|---|---|
-| Dhrubo's machine | Free if it exists | **Unknown — ask first.** He owns `train/`; if he has ≥ 8 GB and Ampere or newer, this is the natural home |
+| Dhrubo's machine | Free | RTX 5060 Ti 16 GB (Blackwell, cc 12.0), driver 580.173.02, torch 2.13.0+cu130, `RESULT: PASS`. 1.5B at group 8 fits; 3B at bf16 does not alongside vLLM. The index, the NLI scorer, baselines, training, the sweep and serving all run here. |
 | Kaggle Notebooks | Free, 30 h/week | 2× T4 16 GB. Turing (7.5): fp16 only, no FA2. Enough for 1.5B. 12 h session cap and no persistent disk — needs checkpoint-to-cloud |
 | Rented GPU (Vast.ai / RunPod) | ~$0.3–0.5/h | 4090 24 GB or A40 48 GB. bf16 and FA2 both work. The four-run λ sweep on 3B is the real bill — estimate it before committing |
 | University cluster | Free if available | Worth one email. Queue latency is the risk |
