@@ -1,8 +1,8 @@
-"""Tests for the proposed shared contract.
+"""Tests for the shared contract, as agreed on #2.
 
 These pin down what the computed properties in `verisearch/types.py` actually
-mean. They are part of the P1 proposal: if the contract session changes the
-contract, these change with it. Table-driven per PROJECT.md section 3.
+mean. If the contract changes, these change with it, in a PR both owners
+approve. Table-driven per PROJECT.md section 3.
 """
 
 from __future__ import annotations
