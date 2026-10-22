@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -386,14 +388,53 @@ def test_an_empty_question_file_is_refused(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: Git Bash, where `bash` on PATH is not the shell we want.
+_GIT_BASH = (
+    Path("C:/Program Files/Git/bin/bash.exe"),
+    Path("C:/Program Files (x86)/Git/bin/bash.exe"),
+)
+
+
+def _posix_bash() -> str | None:
+    """A bash that can run a script in this repo, or None if there is none.
+
+    On Windows, `bash` on PATH is usually `C:/Windows/System32/bash.exe` - the
+    WSL launcher - which runs in a different filesystem where neither the repo
+    path nor the venv exists. That is why these tests failed on the Jenkins
+    laptop while behaving correctly under Git Bash (A2 on the remaining-work
+    list). Resolve the real shell instead of trusting the name.
+    """
+    found = shutil.which("bash")
+    if found is not None and "system32" not in found.replace("\\", "/").lower():
+        return found
+    return next((str(path) for path in _GIT_BASH if path.is_file()), None)
+
+
 def _run_script(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run `scripts/02_train.sh` the way Jenkins does: through bash, not `uv run`.
+
+    The environment is inherited rather than replaced - the previous version set
+    `PATH` to a POSIX-only value, which is meaningless on Windows - with `PYTHON`
+    pointing at the interpreter running the tests, so the script does not have to
+    guess, and W&B forced offline so a test never touches the network.
+    """
+    bash = _posix_bash()
+    if bash is None:
+        # Not a skip to make CI green (section 10 forbids that): the script under
+        # test is a shell script, and a machine with no POSIX shell cannot run
+        # it at all. Same category as the `gpu` marker.
+        pytest.skip("no POSIX bash on this machine; Git Bash or a Unix shell is needed")
     return subprocess.run(
-        ["bash", "scripts/02_train.sh", *args],
+        [bash, "scripts/02_train.sh", *args],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=False,
-        env={"PATH": "/usr/bin:/bin", "PYTHON": sys.executable, "HOME": str(REPO_ROOT)},
+        env={
+            **os.environ,
+            "PYTHON": Path(sys.executable).as_posix(),
+            "WANDB_MODE": "offline",
+        },
     )
 
 
