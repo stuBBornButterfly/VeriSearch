@@ -16,6 +16,10 @@
 # Owner: Ayesha.
 set -euo pipefail
 
+# Which interpreter runs the CLI: see _python.sh.
+# shellcheck source=scripts/_python.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_python.sh"
+
 CORPUS="${CORPUS:-data/processed/corpus.jsonl}"
 OUT="${OUT:-data/index/corpus}"
 MODEL="${MODEL:-BAAI/bge-small-en-v1.5}"
@@ -36,7 +40,7 @@ done
 
 echo "building index from ${CORPUS} into ${OUT}"
 
-python -m verisearch.cli "${PLAN[@]}" build-index \
+"${PYTHON}" -m verisearch.cli "${PLAN[@]}" build-index \
   --corpus "${CORPUS}" \
   --out "${OUT}" \
   --model "${MODEL}" \

@@ -40,6 +40,10 @@
 # Owner: Ayesha.
 set -euo pipefail
 
+# Which interpreter runs the CLI: see _python.sh.
+# shellcheck source=scripts/_python.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_python.sh"
+
 INDEX="${INDEX:-data/index/corpus}"
 EXAMPLES="${EXAMPLES:-data/processed/hotpotqa_dev.jsonl}"
 DATASET="${DATASET:-hotpotqa}"
@@ -75,7 +79,7 @@ done
 # counts as a drop - is in eval-regression, where it is tested. --n and
 # --max-f1-drop pass straight through.
 if [[ -n "${REGRESSION}" ]]; then
-  exec python -m verisearch.cli "${PLAN[@]}" eval-regression \
+  exec "${PYTHON}" -m verisearch.cli "${PLAN[@]}" eval-regression \
     --examples "${REGRESSION_EXAMPLES}" \
     --index "${INDEX}" \
     --reference "${REGRESSION_REFERENCE}" \
@@ -94,7 +98,7 @@ if [[ -f "${CONTEXT}" && -z "${FORCE_CONTEXT:-}" ]]; then
   echo "           set FORCE_CONTEXT=1 to rebuild - but every report already"
   echo "           written against the old one becomes incomparable"
 else
-  python -m verisearch.cli "${PLAN[@]}" eval-context \
+  "${PYTHON}" -m verisearch.cli "${PLAN[@]}" eval-context \
     --index "${INDEX}" \
     --examples "${EXAMPLES}" \
     --dataset "${DATASET}" \
@@ -119,7 +123,7 @@ fi
 
 REPORT="${REPORT:-${RESULTS_DIR}/${RUN_NAME}/report.json}"
 
-python -m verisearch.cli "${PLAN[@]}" eval-report \
+"${PYTHON}" -m verisearch.cli "${PLAN[@]}" eval-report \
   --results "${RESULTS}" \
   --context "${CONTEXT}" \
   --run-name "${RUN_NAME}" \

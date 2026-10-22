@@ -32,6 +32,10 @@
 # Owner: Ayesha.
 set -euo pipefail
 
+# Which interpreter runs the CLI: see _python.sh.
+# shellcheck source=scripts/_python.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_python.sh"
+
 MANIFEST="${MANIFEST:-configs/sweep_lambda.yaml}"
 OUT="${OUT:-results/frontier.md}"
 FIGURE="${FIGURE:-}"
@@ -59,7 +63,7 @@ if [[ -n "${FIGURE}" ]]; then
   FIGURE_ARGS=(--figure "${FIGURE}")
 fi
 
-python -m verisearch.cli "${PLAN[@]}" frontier \
+"${PYTHON}" -m verisearch.cli "${PLAN[@]}" frontier \
   --manifest "${MANIFEST}" \
   --out "${OUT}" \
   ${FIGURE_ARGS[@]+"${FIGURE_ARGS[@]}"} \

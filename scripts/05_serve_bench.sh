@@ -39,6 +39,10 @@
 # Owner: Ayesha.
 set -euo pipefail
 
+# Which interpreter runs the CLI: see _python.sh.
+# shellcheck source=scripts/_python.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_python.sh"
+
 EXAMPLES="${EXAMPLES:-data/processed/hotpotqa_dev.jsonl}"
 CONFIG="${CONFIG:-configs/base.yaml}"
 OUT_DIR="${OUT_DIR:-results/raw/serve}"
@@ -64,7 +68,7 @@ if [[ -n "${SERVE_URL}" ]]; then
   URL=(--url "${SERVE_URL}")
 fi
 
-python -m verisearch.cli "${PLAN[@]}" serve-bench \
+"${PYTHON}" -m verisearch.cli "${PLAN[@]}" serve-bench \
   --examples "${EXAMPLES}" \
   --config "${CONFIGS[@]}" \
   --out "${OUT_DIR}" \

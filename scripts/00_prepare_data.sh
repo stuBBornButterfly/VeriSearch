@@ -27,6 +27,10 @@
 # Owner: Ayesha.
 set -euo pipefail
 
+# Which interpreter runs the CLI: see _python.sh.
+# shellcheck source=scripts/_python.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_python.sh"
+
 OUT="${OUT:-data/processed}"
 SEED="${SEED:-42}"
 LIMIT="${LIMIT:-}"
@@ -46,7 +50,7 @@ if [[ -n "${LIMIT}" ]]; then
   LIMIT_ARGS=(--limit "${LIMIT}")
 fi
 
-python -m verisearch.cli "${PLAN[@]}" prepare-data \
+"${PYTHON}" -m verisearch.cli "${PLAN[@]}" prepare-data \
   --out "${OUT}" \
   --seed "${SEED}" \
   ${LIMIT_ARGS[@]+"${LIMIT_ARGS[@]}"} \
