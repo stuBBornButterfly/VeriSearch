@@ -1,15 +1,14 @@
 """Shared contract between the retrieval/eval half and the RL half.
 
-**STATUS: PROPOSAL. NOT AGREED. DO NOT MERGE.**
+**STATUS: AGREED on #2, 2026-10-22.** Proposed by Ayesha, approved by Dhrubo.
 
 PROJECT.md section 3 says these interfaces are agreed in P1 and then treated as
-stable, and KICKOFF.md allots 20 minutes of the first session to agreeing them
-together. This file exists so that meeting starts from something concrete
-instead of a blank page. Every `DECIDE:` block below is a question for that
-meeting, not a decision already taken.
+stable. Each `DECIDED:` block below records a question the proposal asked, the
+answer it got on #2, and why, so a later change starts from the reasoning
+rather than from the code. One answer lands in its own PR: the `Retriever`
+throughput question, answered by `search_batch` in #21.
 
-Ownership once agreed: shared. Changes after P1 exit need a PR both owners
-approve.
+Ownership: shared. Changes after P1 exit need a PR both owners approve.
 """
 
 from __future__ import annotations
@@ -120,31 +119,32 @@ class Passage(BaseModel):
     title: str
     text: str
     score: float | None = None
-    # DECIDE: keep `score`? The reward never reads it; eval needs it for
-    # recall@k, and a fake retriever has nothing meaningful to put there - hence
-    # `| None`. The alternative is dropping it here and returning scores
-    # alongside, which keeps Passage honest and complicates the signature.
+    # DECIDED on #2: keep `score`, optional. The reward never reads it; eval
+    # needs it for recall@k, and a fake retriever has nothing meaningful to put
+    # there - hence `| None`. The alternative was dropping it here and returning
+    # scores alongside, which keeps Passage honest and complicates the signature.
 
 
 class Turn(BaseModel):
     """One segment of a trajectory.
 
-    DECIDE - the most important question in this file. Does a Turn carry its
-    token ids?
+    DECIDED on #2: yes, a Turn carries its token ids. The most important
+    question in this file.
 
-    If yes, loss masking becomes a pure function of the trajectory, and
+    With them, loss masking is a pure function of the trajectory, and
     `tests/test_masking.py` - mandatory and blocking per PROJECT.md section 3 -
-    can assert on a plain data structure with no model and no GPU. That is the
+    asserts on a plain data structure with no model and no GPU. That is the
     highest-value test in the project and it should be cheap to write.
 
-    If no, masking lives inside the rollout loop and testing it needs a
-    tokenizer and a forward pass. The bug it guards against is invisible in
-    training curves, so an expensive test is a test that rots.
+    Without them, masking lives inside the rollout loop and testing it needs a
+    tokenizer and a forward pass. The blocking pipeline installs `[dev]` only,
+    so that test could not run there at all - and the bug it guards against is
+    invisible in training curves, so a test that cannot run is a test that rots.
 
-    Cost of yes: memory and JSONL size - eight rollouts x four turns x a few
-    hundred tokens, held for a whole group. Mitigation is the empty-tuple
-    default below: populate during training, leave empty when trajectories are
-    built for reading or eval.
+    Cost: memory and JSONL size - eight rollouts x four turns x a few hundred
+    tokens, held for a whole group. Mitigation is the empty-tuple default
+    below: populate during training, leave empty when trajectories are built
+    for reading or eval.
     """
 
     model_config = _FROZEN
@@ -214,11 +214,11 @@ class FaithfulnessResult(BaseModel):
 class Trajectory(BaseModel):
     """One complete episode. The unit everything downstream reads.
 
-    DECIDE: flat `turns` tuple, as proposed here, or a nested structure of
-    (think, search, info) steps? Flat serializes cleanly to JSONL and is easy to
-    read by eye - and PROJECT.md section 15 requires reading raw trajectories
-    after every significant change. Nested makes "how many searches" structural
-    rather than a count. Proposing flat, with counts as computed properties.
+    DECIDED on #2: a flat `turns` tuple, not a nested structure of (think,
+    search, info) steps. Flat serializes cleanly to JSONL and is easy to read by
+    eye - and PROJECT.md section 15 requires reading raw trajectories after
+    every significant change. Nested would make "how many searches" structural
+    rather than a count; here the counts are computed properties instead.
     """
 
     model_config = _FROZEN
@@ -285,19 +285,16 @@ class Trajectory(BaseModel):
 class RewardBreakdown(BaseModel):
     """Per-component reward values plus the composed total.
 
-    DECIDE: should `RewardComponent.__call__` return a bare float, as PROJECT.md
-    section 3 writes it, or should composition produce this?
+    DECIDED on #2: components stay `-> float`, as PROJECT.md section 3 writes
+    them, and `rewards/compose.py` builds this. Nothing in the protocol changes.
 
-    For: PROJECT.md section 6 names four reward hacks and makes documenting them
-    a deliverable. You cannot see "faithfulness went flat while correctness
-    rose" in a scalar. Per-component values have to reach W&B and the trajectory
-    dump, which means surviving composition.
+    Why this exists: PROJECT.md section 6 names four reward hacks and makes
+    documenting them a deliverable. You cannot see "faithfulness went flat while
+    correctness rose" in a scalar. Per-component values have to reach W&B and
+    the trajectory dump, which means surviving composition.
 
-    Against: it couples every component to a container type and dilutes the
-    pure-function rule in section 3.
-
-    Proposing: components stay `-> float` per the existing contract, and
-    `rewards/compose.py` builds this. Nothing in the protocol changes.
+    Why components do not return it: that would couple every component to a
+    container type and dilute the pure-function rule in section 3.
     """
 
     model_config = _FROZEN
@@ -370,19 +367,20 @@ class RewardComponent(Protocol):
     def __call__(self, traj: Trajectory) -> float: ...
 
 
-# DECIDE: add `@runtime_checkable` to these three? It lets `tests/conftest.py`
-# assert the fakes satisfy the protocol via `isinstance`, which catches a fake
+# DECIDED on #2: no `@runtime_checkable` on these three. It would let a test
+# assert the fakes satisfy the protocols via `isinstance`, catching a fake
 # drifting out of sync with the real implementation - exactly the failure mode
-# that makes fakes dangerous. mypy already checks this statically at every call
-# site, so it only buys a clearer test failure message.
+# that makes fakes dangerous. `testing.fakes.conformance_witnesses` (#9)
+# already catches that statically under `mypy --strict`, so it would only buy
+# a clearer failure message.
 
-# DECIDE: where does the GRPO group type live? Advantage is
+# DECIDED on #2: the GRPO group type is Dhrubo's, in `train/`. Advantage is
 # `(r_i - mean(r)) / std(r)` over a group of 8, so something must hold the
-# group. If only `train/grpo.py` ever sees it, it belongs in `train/`. If eval
-# reads groups out of a dump to inspect within-group variance, it crosses the
-# boundary and belongs here. Leaning: Dhrubo's, in `train/`, until eval needs it.
+# group, and only `train/grpo.py` sees it. If eval ever reads groups out of a
+# dump to inspect within-group variance, it crosses the boundary and moves
+# here, in a PR both owners approve.
 
-# DECIDE: embeddings. PROJECT.md section 3 mandates
-# `numpy.typing.NDArray[np.float32]` over bare `np.ndarray`. Nothing here needs
-# an array yet - the embedder is internal to `retrieval/`. Add an `Embedding`
-# alias only once a second module starts passing vectors around.
+# DECIDED on #2: no `Embedding` alias yet. PROJECT.md section 3 mandates
+# `numpy.typing.NDArray[np.float32]` over bare `np.ndarray`, but nothing here
+# needs an array - the embedder is internal to `retrieval/`. Add the alias once
+# a second module starts passing vectors around.
