@@ -141,15 +141,25 @@ def test_each_script_runs_the_interpreter_it_was_given(
 
 
 @pytest.mark.integration
-def test_a_script_runs_the_real_cli_without_being_told_which_python(bash: str) -> None:
-    """What Jenkins does: no PYTHON, so the helper finds the project's own."""
+def test_a_script_runs_the_real_cli_without_being_told_which_python(
+    bash: str, tmp_path: Path
+) -> None:
+    """What Jenkins does: no PYTHON, so the helper finds the project's own.
+
+    The corpus is a one-line file here, not `data/processed/corpus.jsonl`:
+    `data/` is gitignored, so a fresh CI checkout has none, and a test that
+    passes only where the data happens to exist is testing the laptop.
+    """
+    corpus = tmp_path / "corpus.jsonl"
+    corpus.write_text('{"doc_id": "d1", "title": "T", "text": "x"}\n', encoding="utf-8")
+
     result = subprocess.run(
         [bash, "scripts/01_build_index.sh", "--plan"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=False,
-        env=_environment(),
+        env=_environment(CORPUS=corpus.as_posix(), OUT=(tmp_path / "index").as_posix()),
     )
 
     assert result.returncode == 0, result.stderr
