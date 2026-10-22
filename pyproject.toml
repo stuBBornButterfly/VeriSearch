@@ -148,5 +148,21 @@ exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
-    "\\.\\.\\.",
+    # Protocol and stub bodies. Both forms: an ellipsis alone on its own line,
+    # and the one-liner `def f(self, x: int) -> Y: ...`.
+    #
+    # Both patterns are anchored, and that is the point. They replace a bare
+    # "\\.\\.\\." which, as a regex, matched *any* line containing three dots -
+    # including every `-> tuple[X, ...]` annotation, which is required typing
+    # syntax and appears throughout this codebase. coverage.py excludes the
+    # entire block when an excluded line opens one, so every function returning
+    # a tuple had its whole body dropped from measurement. Measured on one test
+    # run of the data branch: 248 statements counted where there were 370. The
+    # 80% floor was being enforced against roughly two thirds of the package,
+    # and the modules worst affected were the ones that return tuples
+    # everywhere - data/, faithfulness/, types.py.
+    #
+    # If you add a pattern here, check it against `-> tuple[X, ...]` first.
+    "^\\s*\\.\\.\\.$",
+    ":\\s*\\.\\.\\.$",
 ]
