@@ -1,0 +1,38 @@
+# Dev overlay. Owner: Ayesha. Compose on top of base.yaml:
+#
+#     load_config("configs/base.yaml", "configs/dev_1.5b.yaml")
+#
+# Purpose: the fast loop. Every debugging run, and the P3 overfit test, happen
+# here. Nothing in this file may change a value the experiment is *measuring* -
+# the frontier is produced by train_3b.yaml plus sweep_lambda.yaml, and a dev
+# setting that leaked into a reported number would be unfindable.
+#
+# So: no reward weights, no lambda, no group_size, no kl_beta here. Those stay
+# exactly as base.yaml sets them. Only cost and patience are reduced.
+
+model:
+  # base.yaml is already 1.5B; restated so this file is readable on its own and
+  # so a later change to base.yaml's policy cannot silently retarget dev runs.
+  policy: Qwen2.5-1.5B-Instruct
+  policy_repo: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: bfloat16
+  load_in_4bit: false
+
+env:
+  # Shorter completions. Enough for four searches and an answer in the format
+  # from PROJECT.md section 3, not enough for the model to ramble while you are
+  # waiting on it.
+  max_new_tokens: 320
+  search_budget: 4
+  max_turns: 6
+
+train:
+  # The overfit test needs to reach memorisation on 20 questions, not to train
+  # a usable model. If it has not overfitted by 150 steps the loop is broken,
+  # and running 1000 steps to find that out wastes an hour per attempt.
+  max_steps: 150
+
+eval:
+  # Floor in config.py is 100. Dev eval is a smoke signal, not a result; no
+  # number from a dev run goes in the writeup, so the CI width does not matter.
+  bootstrap_resamples: 200
