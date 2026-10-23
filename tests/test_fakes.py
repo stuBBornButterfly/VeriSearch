@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from verisearch.retrieval.client import RetrievalError
 from verisearch.testing import (
     DEFAULT_CORPUS,
     FakeFaithfulnessScorer,
@@ -464,3 +465,92 @@ def test_the_fake_refuses_bad_batch_input(
     against a live service at group 8."""
     with pytest.raises(ValueError, match=r"k must be positive|at least one query"):
         fake_retriever.search_batch(queries, k)
+
+
+# ---------------------------------------------------------------------------
+# FakeRetriever(fail_on=...) - an outage mid-episode, without a dead service
+# ---------------------------------------------------------------------------
+
+
+def test_only_the_chosen_call_fails() -> None:
+    retriever = FakeRetriever(fail_on=(2,))
+
+    assert retriever.search("Ada Lovelace", 1)
+    with pytest.raises(RetrievalError, match="injected failure on call 2"):
+        retriever.search("Analytical Engine", 1)
+    assert retriever.search("Charles Babbage", 1)
+
+
+def test_the_injected_failure_is_the_real_clients_exception() -> None:
+    """One class, so an `except` the episode loop writes against the fake is
+    the one that catches the real service going down. It is also a
+    `ValueError`, as every other refusal from the fake is."""
+    retriever = FakeRetriever(fail_on=(1,))
+    with pytest.raises(RetrievalError) as raised:
+        retriever.search("anything", 1)
+    assert type(raised.value) is RetrievalError
+    assert isinstance(raised.value, ValueError)
+
+
+def test_a_failed_call_is_still_recorded() -> None:
+    """It was attempted. Whether that costs budget is the loop's rule."""
+    retriever = FakeRetriever(fail_on=(1,))
+    with pytest.raises(RetrievalError):
+        retriever.search("Ada Lovelace", 3)
+    assert retriever.calls == [("Ada Lovelace", 3)]
+
+
+def test_every_call_after_n_can_fail() -> None:
+    """The service going down and staying down."""
+    retriever = FakeRetriever(fail_on=range(2, 10))
+    retriever.search("first", 1)
+    for query in ("second", "third", "fourth"):
+        with pytest.raises(RetrievalError):
+            retriever.search(query, 1)
+
+
+def test_a_batch_fails_as_a_whole_and_records_every_query() -> None:
+    """A batch is one request to the service, so it cannot half-succeed."""
+    retriever = FakeRetriever(fail_on=(3,))
+    retriever.search("one", 1)
+
+    with pytest.raises(RetrievalError, match="call 3"):
+        retriever.search_batch(["two", "three", "four"], 1)
+    assert retriever.queries == ("one", "two", "three", "four")
+
+    assert len(retriever.search_batch(["five", "six"], 1)) == 2
+
+
+def test_a_batch_that_misses_the_failing_number_succeeds() -> None:
+    retriever = FakeRetriever(fail_on=(5,))
+    assert len(retriever.search_batch(["one", "two", "three"], 2)) == 3
+
+
+def test_reset_restarts_the_count() -> None:
+    """Numbering per episode, when a test resets between episodes."""
+    retriever = FakeRetriever(fail_on=(1,))
+    with pytest.raises(RetrievalError):
+        retriever.search("one", 1)
+    retriever.reset()
+    with pytest.raises(RetrievalError):
+        retriever.search("one again", 1)
+
+
+def test_a_bad_k_is_refused_before_it_counts_as_a_call() -> None:
+    """A caller bug stays a caller bug, not an injected outage."""
+    retriever = FakeRetriever(fail_on=(1,))
+    with pytest.raises(ValueError, match="k must be positive"):
+        retriever.search("one", 0)
+    assert retriever.calls == []
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_fail_on_numbers_calls_from_one(bad: int) -> None:
+    with pytest.raises(ValueError, match="numbers calls from 1"):
+        FakeRetriever(fail_on=(bad,))
+
+
+def test_no_call_fails_by_default(fake_retriever: FakeRetriever) -> None:
+    for number in range(20):
+        fake_retriever.search(f"query {number}", 1)
+    fake_retriever.search_batch(["a", "b", "c"], 1)

@@ -21,7 +21,8 @@ correct and makes a faithfulness reward look saturated. So `DEFAULT_CORPUS`
 carries distractors, retrieval returns `k` results whether or not they are any
 good - which is what a dense index actually does - and every failure mode the
 RL half needs to exercise is reachable: no hits, fewer than `k` hits, repeated
-queries, an empty query, an unanswered episode.
+queries, an empty query, an unanswered episode, a retrieval service that goes
+down mid-episode.
 """
 
 from __future__ import annotations
@@ -29,6 +30,10 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Sequence
 
+# The real client's exception, not a lookalike: an `except` written against the
+# fake has to catch the real retriever's outage too, and the only way to be sure
+# of that is for the two to be one class. No torch or FAISS behind this import.
+from verisearch.retrieval.client import RetrievalError
 from verisearch.types import (
     Claim,
     Entailment,
@@ -142,6 +147,17 @@ class FakeRetriever:
     `blind_to` forces the genuinely-zero-results path without emptying the
     corpus. Every call is recorded on `calls`, which is how the search budget
     and the duplicate-query penalty get tested with no service running.
+
+    `fail_on` makes chosen calls raise `RetrievalError`, which is what the real
+    client raises when the service cannot be reached. The episode loop has to
+    decide what an outage mid-episode means - abort the rollout, or carry on
+    with an empty `<info>` - and that decision is tested here rather than
+    against a dead service. Calls are numbered from 1, one per query, since
+    construction or the last `reset()`. A failed call is still recorded,
+    because it was attempted; whether an attempt costs budget is the episode
+    loop's rule, not the fake's. A batch is one request against the service,
+    so here too it fails as a whole when any of its queries lands on a failing
+    number, and every query in it is recorded.
     """
 
     def __init__(
@@ -149,9 +165,14 @@ class FakeRetriever:
         corpus: Sequence[Passage] = DEFAULT_CORPUS,
         *,
         blind_to: Iterable[str] = (),
+        fail_on: Iterable[int] = (),
     ) -> None:
         self._corpus = tuple(corpus)
         self._blind_to = frozenset(query.strip().lower() for query in blind_to)
+        self._fail_on = frozenset(fail_on)
+        if any(number < 1 for number in self._fail_on):
+            msg = f"fail_on numbers calls from 1, got {sorted(self._fail_on)}"
+            raise ValueError(msg)
         self.calls: list[tuple[str, int]] = []
 
     def search(self, query: str, k: int) -> list[Passage]:
@@ -163,6 +184,10 @@ class FakeRetriever:
             msg = f"k must be positive, got {k}"
             raise ValueError(msg)
         self.calls.append((query, k))
+        self._fail_if_chosen(len(self.calls), len(self.calls))
+        return self._rank(query, k)
+
+    def _rank(self, query: str, k: int) -> list[Passage]:
         normalised = query.strip().lower()
         if not normalised or normalised in self._blind_to:
             return []
@@ -186,7 +211,17 @@ class FakeRetriever:
         if not queries:
             msg = "search_batch needs at least one query"
             raise ValueError(msg)
-        return [self.search(query, k) for query in queries]
+        first = len(self.calls) + 1
+        self.calls.extend((query, k) for query in queries)
+        self._fail_if_chosen(first, len(self.calls))
+        return [self._rank(query, k) for query in queries]
+
+    def _fail_if_chosen(self, first: int, last: int) -> None:
+        """Raise if any call numbered `first`..`last` is one `fail_on` chose."""
+        chosen = sorted(number for number in self._fail_on if first <= number <= last)
+        if chosen:
+            msg = f"FakeRetriever: injected failure on call {chosen[0]} (fail_on={sorted(self._fail_on)})"
+            raise RetrievalError(msg)
 
     @staticmethod
     def _overlap(query_tokens: frozenset[str], passage: Passage) -> float:
