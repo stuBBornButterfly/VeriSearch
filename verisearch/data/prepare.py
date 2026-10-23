@@ -48,7 +48,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from verisearch.data.build_corpus import (
     CorpusBuild,
@@ -88,6 +88,7 @@ _FROZEN = ConfigDict(frozen=True, extra="forbid")
 CORPUS_FILENAME = "corpus.jsonl"
 MANIFEST_FILENAME = "manifest.json"
 LEAKAGE_FILENAME = "leakage.json"
+COVERAGE_FILENAME = "coverage_gaps.json"
 
 # How many missing titles the manifest lists by name. The count is always
 # exact; the list is a sample for whoever has to work out why.
@@ -110,10 +111,41 @@ class DatasetPart(BaseModel):
     # (normalised title, whitespace-normalised sentence) for every supporting
     # fact, taken from the example's own context.
     evidence: tuple[tuple[str, str], ...] = ()
+    # The question each `evidence` entry came from, position for position, so a
+    # sentence missing from the corpus can be traced to the questions it makes
+    # unanswerable. Empty only for a part built by hand.
+    evidence_question_ids: tuple[str, ...] = ()
     # Supporting facts that could not be resolved to a sentence in their own
     # row - an id past the end of the paragraph, a title the context does not
     # have. A defect in the data, not in the corpus, so counted, not failed.
     evidence_unreadable: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _ids_line_up(self) -> DatasetPart:
+        if self.evidence_question_ids and len(self.evidence_question_ids) != len(self.evidence):
+            raise ValueError(
+                f"{len(self.evidence_question_ids)} question ids for {len(self.evidence)} "
+                f"evidence entries - they are paired by position"
+            )
+        return self
+
+
+class CoverageGap(BaseModel):
+    """One question whose gold evidence is not all in the corpus.
+
+    Dhrubo's question on #24: when a trajectory looks unanswerable, is it the
+    policy or the data? The manifest's counts say how much is missing; this
+    says which questions, so the answer is one lookup by question id.
+    """
+
+    model_config = _FROZEN
+
+    question_id: str
+    dataset: str
+    # Normalised titles with no document in the corpus.
+    missing_titles: tuple[str, ...] = ()
+    # "title: sentence", cut to 80 characters like the manifest's sample.
+    missing_sentences: tuple[str, ...] = ()
 
 
 class DatasetSummary(BaseModel):
@@ -167,6 +199,10 @@ class Manifest(BaseModel):
     evidence_missing: int = Field(ge=0)
     evidence_missing_sample: tuple[str, ...]
     evidence_unreadable: int = Field(ge=0)
+    # Questions with a missing title or a missing sentence. Every id, with what
+    # it is missing, is in `coverage_gaps.json`; this is a count and a sample.
+    questions_missing_evidence: int = Field(default=0, ge=0)
+    questions_missing_evidence_sample: tuple[str, ...] = ()
     files: tuple[str, ...]
 
     def problems(self) -> tuple[str, ...]:
@@ -215,6 +251,10 @@ class Manifest(BaseModel):
             f"evidence    {self.evidence_missing} gold sentences not in the corpus, "
             f"{self.evidence_unreadable} facts unreadable in their own row"
         )
+        lines.append(
+            f"questions   {self.questions_missing_evidence} missing some gold evidence "
+            f"(every id in {COVERAGE_FILENAME})"
+        )
         return "\n".join(lines)
 
 
@@ -226,6 +266,7 @@ class Prepared(BaseModel):
     examples: tuple[QAExample, ...]
     corpus: CorpusBuild
     leakage: tuple[LeakageGroup, ...]
+    coverage_gaps: tuple[CoverageGap, ...] = ()
     manifest: Manifest
 
 
@@ -239,14 +280,17 @@ def read_dataset(rows: Iterable[Mapping[str, object]], spec: DatasetSpec) -> Dat
     """
     examples: list[QAExample] = []
     evidence: list[tuple[str, str]] = []
+    evidence_ids: list[str] = []
     unreadable = 0
 
     def tap() -> Iterator[Mapping[str, object]]:
         nonlocal unreadable
         for row in rows:
-            examples.append(row_to_example(row, spec))
+            example = row_to_example(row, spec)
+            examples.append(example)
             found, bad = supporting_evidence(row, spec)
             evidence.extend(found)
+            evidence_ids.extend(example.question_id for _ in found)
             unreadable += bad
             yield row
 
@@ -261,6 +305,7 @@ def read_dataset(rows: Iterable[Mapping[str, object]], spec: DatasetSpec) -> Dat
         examples=tuple(examples),
         corpus=corpus,
         evidence=tuple(evidence),
+        evidence_question_ids=tuple(evidence_ids),
         evidence_unreadable=unreadable,
     )
 
@@ -422,6 +467,7 @@ def assemble(
     index = _evidence_index(corpus.docs)
     missing_all: list[str] = []
     evidence_gone: list[tuple[str, str]] = []
+    gaps: list[CoverageGap] = []
     summaries: list[DatasetSummary] = []
     for part in parts:
         own = [e for e in examples if e.dataset == part.spec.name]
@@ -429,6 +475,7 @@ def assemble(
         missing_all.extend(missing)
         gone = missing_evidence(part.evidence, index)
         evidence_gone.extend(gone)
+        gaps.extend(_coverage_gaps(part, own, set(missing), set(gone)))
         summaries.append(
             DatasetSummary(
                 name=part.spec.name,
@@ -466,13 +513,49 @@ def assemble(
             f"{title}: {sentence[:80]}" for title, sentence in evidence_gone[:_MISSING_SAMPLE]
         ),
         evidence_unreadable=sum(part.evidence_unreadable for part in parts),
+        questions_missing_evidence=len(gaps),
+        questions_missing_evidence_sample=tuple(gap.question_id for gap in gaps[:_MISSING_SAMPLE]),
         files=tuple(sorted(_planned_files(examples))),
     )
-    return Prepared(examples=examples, corpus=corpus, leakage=leakage, manifest=manifest)
+    return Prepared(
+        examples=examples,
+        corpus=corpus,
+        leakage=leakage,
+        coverage_gaps=tuple(gaps),
+        manifest=manifest,
+    )
+
+
+def _coverage_gaps(
+    part: DatasetPart,
+    own: Sequence[QAExample],
+    missing_titles: set[str],
+    missing_facts: set[tuple[str, str]],
+) -> list[CoverageGap]:
+    """The questions in one dataset that lost a title or a sentence, sorted by id."""
+    titles: dict[str, set[str]] = {}
+    for example in own:
+        lost = {normalize_title(t) for t in example.supporting_titles} & missing_titles
+        if lost:
+            titles[example.question_id] = lost
+    sentences: dict[str, list[str]] = {}
+    for question_id, fact in zip(part.evidence_question_ids, part.evidence, strict=False):
+        if fact in missing_facts:
+            title, sentence = fact
+            sentences.setdefault(question_id, []).append(f"{title}: {sentence[:80]}")
+    return [
+        CoverageGap(
+            question_id=question_id,
+            dataset=part.spec.name,
+            missing_titles=tuple(sorted(titles.get(question_id, ()))),
+            missing_sentences=tuple(sentences.get(question_id, ())),
+        )
+        for question_id in sorted(titles.keys() | sentences.keys())
+    ]
 
 
 def _planned_files(examples: Sequence[QAExample]) -> set[str]:
-    names = {CORPUS_FILENAME, MANIFEST_FILENAME, LEAKAGE_FILENAME}
+    names = {CORPUS_FILENAME, MANIFEST_FILENAME, LEAKAGE_FILENAME, COVERAGE_FILENAME}
     for example in examples:
         assert example.split is not None, "make_splits assigns every example a split"
         names.add(examples_filename(example.dataset, example.split))
@@ -480,7 +563,8 @@ def _planned_files(examples: Sequence[QAExample]) -> set[str]:
 
 
 def write_prepared(prepared: Prepared, directory: str | Path) -> tuple[Path, ...]:
-    """Write one JSONL per dataset and split, the corpus, leakage and the manifest.
+    """Write one JSONL per dataset and split, the corpus, leakage, coverage gaps
+    and the manifest.
 
     The manifest goes last. A directory with a manifest in it is a finished
     build; one without is an interrupted one, and `prepare-data` refuses to
@@ -507,6 +591,13 @@ def write_prepared(prepared: Prepared, directory: str | Path) -> tuple[Path, ...
         encoding="utf-8",
     )
     written.append(leakage_path)
+
+    coverage_path = target / COVERAGE_FILENAME
+    coverage_path.write_text(
+        json.dumps([gap.model_dump(mode="json") for gap in prepared.coverage_gaps], indent=2),
+        encoding="utf-8",
+    )
+    written.append(coverage_path)
 
     manifest_path = target / MANIFEST_FILENAME
     manifest_path.write_text(prepared.manifest.model_dump_json(indent=2), encoding="utf-8")

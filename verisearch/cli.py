@@ -41,6 +41,7 @@ from verisearch.data.datasets import (
     write_jsonl,
 )
 from verisearch.data.prepare import (
+    COVERAGE_FILENAME,
     MANIFEST_FILENAME,
     assemble,
     download_rows,
@@ -162,6 +163,7 @@ def prepare_data(args: argparse.Namespace) -> int:
     Exits 1, after writing everything, when a supporting title has no document
     in the corpus - the files exist for diagnosis, but recall on them is capped
     and the exit code says so. Same convention as `frontier` and `serve-bench`.
+    It names the questions affected; `coverage_gaps.json` lists every one.
     """
     out_dir = Path(args.out)
     # argparse `choices` has already refused an unknown name.
@@ -194,9 +196,19 @@ def prepare_data(args: argparse.Namespace) -> int:
     for path in write_prepared(prepared, out_dir):
         print(f"wrote {path}")
 
-    problems = prepared.manifest.problems()
+    manifest = prepared.manifest
+    problems = manifest.problems()
     for problem in problems:
         print(f"not usable as-is - {problem}", file=sys.stderr)
+    if manifest.questions_missing_evidence:
+        # Which questions, not only how many: reading a trajectory that looks
+        # unanswerable, this is how to tell the policy from the data.
+        shown = ", ".join(manifest.questions_missing_evidence_sample[:5])
+        print(
+            f"questions affected: {manifest.questions_missing_evidence}, e.g. {shown}. "
+            f"Every id, with what it is missing: {out_dir / COVERAGE_FILENAME}",
+            file=sys.stderr,
+        )
     return 1 if problems else 0
 
 
