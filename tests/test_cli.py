@@ -180,6 +180,7 @@ def write_sweep_reports(
             recall_at_k=ci(0.7),
             failure_breakdown=dict.fromkeys((r.value for r in FailureReason), 0.2),
             duplicate_query_episode_rate=0.1,
+            trained_lambda=value,
         )
         target = root / "out" / run_name / REPORT_FILENAME
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1437,8 +1438,14 @@ def test_prepare_data_exits_1_when_a_gold_paragraph_is_missing(
     code = main(["prepare-data", "--out", str(out), "--datasets", "hotpotqa"])
 
     assert code == 1
-    assert "recall is capped" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "recall is capped" in err
+    # Which question, so a trajectory that looks unanswerable can be checked
+    # against the data before the policy is blamed.
+    assert "questions affected: 1, e.g. hotpotqa-h0." in err
+    assert "coverage_gaps.json" in err
     assert (out / "manifest.json").is_file()  # written, for diagnosis
+    assert (out / "coverage_gaps.json").is_file()
 
 
 def test_prepare_data_reports_a_bad_field_map_in_one_line(

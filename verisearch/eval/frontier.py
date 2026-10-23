@@ -143,7 +143,26 @@ def point_from(report: EvalReport, lambda_value: float) -> FrontierPoint:
     Accuracy is F1, not EM. Section 9 reports both, but the frontier needs the
     one that moves continuously - EM on a few hundred multi-hop questions steps
     in visible jumps and makes a four-point curve look like a staircase.
+
+    The report has to say which lambda its policy was trained with, and it has
+    to be `lambda_value`. Dhrubo's point on #16: a lambda taken only from the
+    caller trusts that no report was filed under the wrong run, and a
+    mismatched lambda is a silently wrong frontier - the one figure the
+    project is for. So this asserts rather than trusts.
     """
+    # ASCII in both messages: they reach stderr. See `load_sweep_results`.
+    if report.trained_lambda is None:
+        raise EvalError(
+            f"{report.run_name} does not record the lambda its policy was trained with, "
+            f"so it cannot be placed at lambda={lambda_value:g}. A trained run's report "
+            f"carries it from the checkpoint; a baseline's never does."
+        )
+    if report.trained_lambda != lambda_value:
+        raise EvalError(
+            f"{report.run_name} was trained at lambda={report.trained_lambda:g} but is "
+            f"being read as the lambda={lambda_value:g} point. A report in the wrong "
+            f"run's place draws a plausible frontier that is wrong."
+        )
     return FrontierPoint(
         lambda_value=lambda_value,
         run_name=report.run_name,
@@ -390,6 +409,11 @@ def load_sweep_results(
             report = EvalReport.model_validate_json(path.read_text(encoding="utf-8"))
         except ValueError as exc:
             raise EvalError(f"{path} is not an eval report: {exc}") from exc
+        if report.run_name != run_name:
+            raise EvalError(
+                f"{path} holds run {report.run_name!r}, not {run_name!r} - a report "
+                f"copied into another run's directory"
+            )
         points.append(point_from(report, value))
         reports.append(report)
 

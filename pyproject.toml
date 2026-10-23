@@ -18,6 +18,13 @@ authors = [
 # lint/typecheck/unit/integration stages install exactly this plus [dev].
 dependencies = [
     "pydantic>=2.7,<3",
+    # verisearch/config.py's `_YamlLayer` relies on pydantic-settings reading
+    # a source through `__call__`; its `get_field_value` is a stub, as in the
+    # library's own `DefaultSettingsSource`. If a release stops calling
+    # `__call__`, the YAML never reaches `Config`, `load_config` raises
+    # `ConfigError`, and tests/test_config.py fails loudly. Run it before
+    # taking a new minor version or widening this range. Locked at 2.15.0 in
+    # uv.lock.
     "pydantic-settings>=2.2,<3",
     "pyyaml>=6.0,<7",
     "numpy>=1.26,<3",

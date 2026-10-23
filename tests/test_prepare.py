@@ -23,8 +23,10 @@ from verisearch.data.datasets import (
 )
 from verisearch.data.prepare import (
     CORPUS_FILENAME,
+    COVERAGE_FILENAME,
     LEAKAGE_FILENAME,
     MANIFEST_FILENAME,
+    CoverageGap,
     DatasetPart,
     Manifest,
     assemble,
@@ -252,6 +254,12 @@ def test_a_gold_paragraph_missing_from_the_corpus_is_a_problem() -> None:
     assert prepared.manifest.missing_titles_sample == ("nowhere",)
     (problem,) = prepared.manifest.problems()
     assert "recall is capped" in problem
+    # And which question it caps.
+    assert prepared.coverage_gaps == (
+        CoverageGap(question_id="hotpotqa-h99", dataset="hotpotqa", missing_titles=("nowhere",)),
+    )
+    assert prepared.manifest.questions_missing_evidence == 1
+    assert prepared.manifest.questions_missing_evidence_sample == ("hotpotqa-h99",)
 
 
 def test_near_duplicate_questions_across_splits_are_reported_not_fixed() -> None:
@@ -334,6 +342,7 @@ def test_written_files_round_trip(tmp_path: Path) -> None:
     assert sorted(e.question_id for e in reread) == sorted(e.question_id for e in prepared.examples)
     assert load_corpus(out / CORPUS_FILENAME) == prepared.corpus.docs
     assert json.loads((out / LEAKAGE_FILENAME).read_text(encoding="utf-8")) == []
+    assert json.loads((out / COVERAGE_FILENAME).read_text(encoding="utf-8")) == []
     manifest = Manifest.model_validate_json((out / MANIFEST_FILENAME).read_text(encoding="utf-8"))
     assert manifest == prepared.manifest
 
@@ -533,3 +542,87 @@ def test_the_evidence_reader_needs_both_fields_present() -> None:
         (("ada", "About Ada."),),
         0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Which questions lost evidence - Dhrubo's question on #24
+# ---------------------------------------------------------------------------
+
+
+def test_a_missing_sentence_names_every_question_that_needed_it() -> None:
+    """Same setup as the sentence-level check above: titles present, the gold
+    sentence in none of their documents. All three questions need it."""
+    examples_from = read_dataset(once([hotpot_row(i) for i in range(3)]), HOTPOT)
+    other_rows = [
+        hotpot_row(0)
+        | {"context": {"title": ["Ada", "Distractor 0"], "sentences": [["Not it."], ["No."]]}}
+    ]
+    mixed = examples_from.model_copy(
+        update={"corpus": read_dataset(once(other_rows), HOTPOT).corpus}
+    )
+
+    prepared = assemble([mixed], seed=42, built_at=STAMP)
+
+    assert [gap.question_id for gap in prepared.coverage_gaps] == [
+        "hotpotqa-h0",
+        "hotpotqa-h1",
+        "hotpotqa-h2",
+    ]
+    for gap in prepared.coverage_gaps:
+        assert gap.missing_titles == ()
+        assert gap.missing_sentences == ("ada: About Ada.",)
+    assert prepared.manifest.questions_missing_evidence == 3
+
+
+def test_a_clean_build_has_no_gaps() -> None:
+    prepared = assemble(parts(), seed=42, built_at=STAMP)
+    assert prepared.coverage_gaps == ()
+    assert prepared.manifest.questions_missing_evidence == 0
+    assert "questions   0 missing some gold evidence" in prepared.manifest.summary()
+
+
+def test_the_gaps_file_lists_every_question_with_what_it_is_missing(tmp_path: Path) -> None:
+    rows = [hotpot_row(i) for i in range(3)]
+    rows.append(hotpot_row(7, gold="Nowhere", context_titles=("Elsewhere",)))
+    prepared = assemble([read_dataset(once(rows), HOTPOT)], seed=42, built_at=STAMP)
+    out = tmp_path / "processed"
+    write_prepared(prepared, out)
+
+    gaps = json.loads((out / COVERAGE_FILENAME).read_text(encoding="utf-8"))
+
+    assert gaps == [
+        {
+            "question_id": "hotpotqa-h7",
+            "dataset": "hotpotqa",
+            "missing_titles": ["nowhere"],
+            "missing_sentences": [],
+        }
+    ]
+    assert COVERAGE_FILENAME in prepared.manifest.files
+
+
+def test_every_evidence_entry_knows_its_question() -> None:
+    part = read_dataset(once([hotpot_row(i) for i in range(4)]), HOTPOT)
+    assert part.evidence_question_ids == tuple(f"hotpotqa-h{i}" for i in range(4))
+    assert len(part.evidence_question_ids) == len(part.evidence)
+
+
+def test_question_ids_must_line_up_with_the_evidence() -> None:
+    part = read_dataset(once([hotpot_row(i) for i in range(2)]), HOTPOT)
+    with pytest.raises(ValueError, match="paired by position"):
+        DatasetPart.model_validate(
+            part.model_dump() | {"evidence_question_ids": ("h0",)},
+        )
+
+
+def test_a_manifest_written_before_the_gap_fields_still_loads() -> None:
+    """`data/processed/manifest.json` from the full build predates them."""
+    manifest = assemble(parts(), seed=42, built_at=STAMP).manifest
+    older = manifest.model_dump(mode="json")
+    del older["questions_missing_evidence"]
+    del older["questions_missing_evidence_sample"]
+
+    reread = Manifest.model_validate(older)
+
+    assert reread.questions_missing_evidence == 0
+    assert reread.questions_missing_evidence_sample == ()

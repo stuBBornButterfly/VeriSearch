@@ -60,6 +60,7 @@ def make_report(
     fingerprint: str = "idx-abc",
     dataset: str = "hotpotqa",
     question_ids: tuple[str, ...] = ("q1", "q2", "q3"),
+    trained_lambda: float | None = None,
 ) -> EvalReport:
     return EvalReport(
         run_name=run_name,
@@ -80,6 +81,7 @@ def make_report(
         recall_at_k=ci(0.7),
         failure_breakdown=dict.fromkeys((r.value for r in FailureReason), 0.2),
         duplicate_query_episode_rate=0.1,
+        trained_lambda=trained_lambda,
     )
 
 
@@ -98,6 +100,7 @@ def sweep_reports(
             f1=f1,
             searches=count,
             unsupported=rate,
+            trained_lambda=value,
         )
         for value, f1, count, rate in zip(lambdas, f1s, searches, rates, strict=True)
     )
@@ -122,7 +125,9 @@ def test_a_point_carries_both_axes_and_the_hallucination_rate() -> None:
     """Unsupported rate is not an axis, but a point that buys accuracy at fewer
     searches while hallucinating more is not on the frontier this project
     claims, and the only way to see that is to have the number alongside."""
-    report = make_report(run_name="lambda_frontier-lam0.05", f1=0.57, searches=2.1)
+    report = make_report(
+        run_name="lambda_frontier-lam0.05", f1=0.57, searches=2.1, trained_lambda=0.05
+    )
     point = point_from(report, 0.05)
 
     assert point.lambda_value == 0.05
@@ -136,7 +141,7 @@ def test_a_point_carries_both_axes_and_the_hallucination_rate() -> None:
 def test_accuracy_on_the_frontier_is_f1_not_em() -> None:
     """EM on a few hundred multi-hop questions steps in visible jumps and makes
     a four-point curve look like a staircase."""
-    report = make_report(run_name="r", f1=0.6, searches=2.0)
+    report = make_report(run_name="r", f1=0.6, searches=2.0, trained_lambda=0.0)
     assert point_from(report, 0.0).accuracy == report.f1
     assert point_from(report, 0.0).accuracy != report.exact_match
 
@@ -517,3 +522,60 @@ def test_a_hand_built_frontier_exposes_the_same_properties() -> None:
     )
     assert manual.excluded_names == frozenset({points[1].run_name})
     assert [p.lambda_value for p in manual.on_frontier] == [0.0, 0.05, 0.1]
+
+
+# ---------------------------------------------------------------------------
+# A report says which lambda it was trained at - Dhrubo's point on #16
+# ---------------------------------------------------------------------------
+
+
+def test_a_report_without_its_trained_lambda_is_not_a_sweep_point() -> None:
+    """A baseline's report, or one from before the field existed."""
+    report = make_report(run_name="lambda_frontier-lam0.05", f1=0.57, searches=2.1)
+    with pytest.raises(EvalError, match="does not record the lambda"):
+        point_from(report, 0.05)
+
+
+def test_a_report_read_at_the_wrong_lambda_is_refused() -> None:
+    report = make_report(
+        run_name="lambda_frontier-lam0.05", f1=0.57, searches=2.1, trained_lambda=0.02
+    )
+    with pytest.raises(EvalError, match=r"trained at lambda=0\.02 but is being read as"):
+        point_from(report, 0.05)
+
+
+def test_loading_refuses_a_report_filed_under_another_lambda(tmp_path: Path) -> None:
+    """The 0.1 checkpoint's report in the 0.05 directory: right path, right
+    name on disk, wrong policy. Only the lambda the report carries catches it."""
+    _, reports = sweep_reports(EXPECTED_F1, EXPECTED_SEARCHES)
+    spec = write_sweep(tmp_path, reports)
+    target = tmp_path / "out" / sweep_run_name(spec.name, 0.05) / REPORT_FILENAME
+    misfiled = reports[2].model_copy(update={"trained_lambda": 0.1})
+    write_report(misfiled, target)
+
+    with pytest.raises(EvalError, match=r"trained at lambda=0\.1"):
+        load_sweep_results(spec, root=tmp_path)
+
+
+def test_loading_refuses_a_report_copied_into_another_runs_directory(tmp_path: Path) -> None:
+    _, reports = sweep_reports(EXPECTED_F1, EXPECTED_SEARCHES)
+    spec = write_sweep(tmp_path, reports)
+    target = tmp_path / "out" / sweep_run_name(spec.name, 0.05) / REPORT_FILENAME
+    write_report(reports[1], target)
+
+    with pytest.raises(EvalError, match="copied into another run's directory"):
+        load_sweep_results(spec, root=tmp_path)
+
+
+def test_the_summary_says_which_lambda_a_trained_run_used() -> None:
+    trained = make_report(run_name="r", f1=0.6, searches=2.0, trained_lambda=0.05)
+    baseline = make_report(run_name="b", f1=0.6, searches=2.0)
+    assert "trained at lambda=0.05" in trained.summary()
+    assert "trained at lambda" not in baseline.summary()
+
+
+def test_a_report_written_before_the_field_existed_still_loads() -> None:
+    report = make_report(run_name="r", f1=0.6, searches=2.0)
+    older = report.model_dump(mode="json")
+    del older["trained_lambda"]
+    assert EvalReport.model_validate(older).trained_lambda is None

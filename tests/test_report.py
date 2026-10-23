@@ -28,9 +28,10 @@ from verisearch.eval.metrics import FailureReason
 REPORT = Path(__file__).resolve().parent.parent / "writeup" / "report.md"
 MANIFEST = Path(__file__).resolve().parent.parent / "configs" / "sweep_lambda.yaml"
 
-# `EvalReport` fields that identify the run rather than measure it. Everything
+# `EvalReport` fields that identify the run rather than measure it (the trained
+# lambda is the x position of a frontier point, not a measurement). Everything
 # else on the model is a section 9 metric and must have a row in the report.
-_NOT_METRICS = frozenset({"run_name", "kind", "context"})
+_NOT_METRICS = frozenset({"run_name", "kind", "context", "trained_lambda"})
 
 # Metrics that belong in both the in-distribution and the OOD table. The
 # failure breakdown gets its own table, so it is not expected twice.
