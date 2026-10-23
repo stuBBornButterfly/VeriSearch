@@ -260,9 +260,11 @@ VeriSearch/
 │   │   ├── baselines.py
 │   │   ├── metrics.py               # F1, EM, CIs, bootstrap
 │   │   └── frontier.py              # sweep plots
-│   └── serve/                                                        # [Ayesha]
-│       ├── server.py
-│       └── benchmark.py
+│   ├── serve/                                                        # [Ayesha]
+│   │   ├── server.py
+│   │   └── benchmark.py
+│   └── testing/                                                      # [Ayesha]
+│       └── fakes.py                 # fake Retriever, fake scorer, make_trajectory
 ├── scripts/
 │   ├── 00_setup_check.py
 │   ├── 01_build_index.sh
@@ -271,7 +273,7 @@ VeriSearch/
 │   ├── 04_sweep.sh
 │   └── 05_serve_bench.sh
 ├── tests/
-│   ├── conftest.py                  # fake Retriever, fake scorer
+│   ├── conftest.py                  # fixtures over verisearch/testing's fakes
 │   ├── test_parser.py               # Dhrubo
 │   ├── test_rewards.py              # Dhrubo
 │   ├── test_masking.py              # Dhrubo, blocking
