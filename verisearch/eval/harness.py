@@ -130,12 +130,22 @@ class EvalReport(BaseModel):
     # -0.1 duplicate penalty in section 6; a rate that does not fall during
     # training means the penalty is not reaching the policy.
     duplicate_query_episode_rate: float = Field(ge=0.0, le=1.0)
+    # The retrieval-cost lambda the evaluated policy was trained with, taken
+    # from the checkpoint by whatever ran the policy - never from a flag. None
+    # for anything the sweep did not train: the base model and the baselines.
+    # `frontier.point_from` refuses a sweep point without it, because a report
+    # filed under the wrong lambda draws a smooth frontier that is wrong.
+    trained_lambda: float | None = None
 
     def summary(self) -> str:
         lines = [
             f"{self.run_name} ({self.kind.value}) on {self.context.dataset}/{self.context.split}",
             f"  n={self.context.n_examples}  k={self.context.k}  "
             f"retriever={self.context.retriever_fingerprint}",
+        ]
+        if self.trained_lambda is not None:
+            lines.append(f"  trained at lambda={self.trained_lambda:g}")
+        lines += [
             f"  EM                  {self.exact_match}",
             f"  F1                  {self.f1}",
             f"  searches/question   {self.searches_per_question}",
