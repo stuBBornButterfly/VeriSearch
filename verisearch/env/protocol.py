@@ -29,6 +29,7 @@ __all__ = [
     "Tag",
     "check_stop_sequences",
     "render_info",
+    "render_injection",
     "render_prompt",
 ]
 
@@ -115,6 +116,19 @@ def render_info(passages: Sequence[Passage]) -> str:
     else:
         body = "\n".join(f"[{i}] {p.title}: {p.text}" for i, p in enumerate(passages, start=1))
     return f"{Tag.INFO.open}\n{body}\n{Tag.INFO.close}"
+
+
+def render_injection(passages: Sequence[Passage]) -> str:
+    """Exactly what the environment appends to the context after a search.
+
+    The `<info>` block plus the newline on each side of it. The separators are
+    part of the injected text, not added around it later, so the `INFO` turn's
+    text and its token ids describe the same characters - and the context the
+    policy samples from is the context the trainer replays. Ayesha's finding A
+    on #31: with the newlines added outside, turn 2 was sampled after
+    `</search>\\n<info>` and replayed after `</search><info>`.
+    """
+    return f"\n{render_info(passages)}\n"
 
 
 def check_stop_sequences(stop_sequences: Sequence[str]) -> None:
