@@ -8,8 +8,12 @@ patched hack is worth nothing to anyone; a documented one with its mitigation is
 valuable content in the report.
 
 **Status: no reward hack yet.** That needs a training run long enough for the policy to find
-one, and P3 has not run at length. Three findings from the first runs of the loop are recorded
-below, because the same rule applies to them: write it down the day it happens.
+one, and P3 has not run at length. Five findings from building and first running the loop are
+recorded below, because the same rule applies to them: write it down the day it happens.
+
+**None of the five counts toward success criterion 10's "3+ failure cases".** Cases 1, 2, 4
+and 5 are engineering failures of mine; case 3 is what a dead reward looks like, not a hack.
+The cases that count have to come from real training, starting with the first long 1.5B run.
 
 ## 1. Unparseable generations trained on nothing
 
@@ -28,13 +32,12 @@ below, because the same rule applies to them: write it down the day it happens.
   from. Dropping it silently would have trained on nothing while the no-answer penalty still
   reported -0.5 - a quiet hole in the training signal instead of a traceback. The crash was the
   lucky outcome.
-- **Mitigation:** a generation that parses to no turns is kept as a `THINK` turn carrying its
-  ids, so it carries loss, with `Trajectory.parse_failure` recording why it went nowhere
-  (`env/episode.py`). `build_payload` separately refuses an empty completion with its own
-  message rather than letting it reach TRL (`train/rollout.py`). Both tested.
-- **Open question:** `THINK` is the closest honest kind for "the policy wrote something that
-  asked for nothing", but `TurnKind.UNPARSED` would read better in section 9's failure
-  breakdown. Raised on #27 - `TurnKind` is shared, so it needs both approvals.
+- **Mitigation:** a generation that parses to no turns is kept as a `TurnKind.UNPARSED` turn
+  carrying its ids, so it carries loss, with `Trajectory.parse_failure` recording why it went
+  nowhere (`env/episode.py`). `UNPARSED` joined the frozen contract on #2 and is on `main`, so
+  a trajectory dump says the policy ignored the format rather than that it reasoned and gave up.
+  `build_payload` separately refuses an empty completion with its own message rather than
+  letting it reach TRL (`train/rollout.py`). Both tested.
 - **Status:** mitigated.
 
 ## 2. The nightly gate failed for its own bookkeeping
@@ -71,6 +74,52 @@ below, because the same rule applies to them: write it down the day it happens.
 - **Status:** expected for this configuration; the measurement at P2 is what decides whether it
   persists at 1.5B.
 
+## 4. Training replayed a context the model never sampled from
+
+- **Seen:** 2026-10-23, in Ayesha's review of #31. Not found by a run, and no run would have
+  shown it. She reproduced it with a character-level tokenizer and a recording generator.
+- **Symptom:** none in any metric. On turn 2, the policy was sampled from
+  `</search>\n<info>\n...\n</info>\n` and the trainer replayed `</search><info>\n...\n</info>`.
+- **Diagnosis:** mine. The episode loop rebuilt the transcript from decoded text: the overshoot
+  after `</search>` was cut and newlines were added around `<info>`, and the policy re-encoded
+  that string every turn. The payload spliced the raw generated ids and `encode(info)` instead.
+  With Qwen2.5's tokenizer, the context after one search was 218 ids one way and 220 the other,
+  and the first difference was already at the prompt's join with `<think>`.
+- **Why it matters:** every token from turn 2 on was trained on a context it wasn't sampled from,
+  and the importance-sampling ratio compared log-probabilities across two contexts. The loss
+  mask was right throughout, which is why the blocking masking test passed. This is the class of
+  bug the project worries about most: wrong, silent, and invisible in a training curve.
+- **Mitigation:** the token ids are the source of truth. Training's episode keeps a running id
+  context and hands the policy that list, never a string; the separators are part of the
+  injected text, and overshoot is cut from both streams at the token that closed the search
+  (`rl_method.md`, section 2). The test asserts `generator.calls[k] == prompt_ids +
+  completion_ids[:prefix]` for every turn, with a stand-in tokenizer in CI and Qwen's real one in
+  `tests/test_token_context_qwen.py`.
+- **Status:** mitigated, on #28 and #31.
+
+## 5. The 1.5B smoke run did not fit, three times
+
+- **Seen:** 2026-10-25, the first runs of `scripts/02_train.sh --smoke --steps 5` on Qwen2.5-1.5B,
+  the size the nightly stage uses by default. Logs: `outputs/smoke_1.5b_oom_step1.log`,
+  `outputs/smoke_1.5b_oom_step3.log`, then `outputs/smoke_1.5b.log` for the run that passed.
+- **Symptom, in order:**
+  1. vLLM refused to start: 0.88 GiB of KV cache needed for a 32,768-token window, 0.63 GiB
+     available.
+  2. `torch.OutOfMemoryError` in `selective_log_softmax` on step 1, with eight rollouts per
+     forward pass.
+  3. `torch.OutOfMemoryError` in the no-grad log-prob pass on step 3, with two per pass, after
+     two good steps, at a 15.6 GB peak.
+- **Diagnosis:** the earlier smoke runs used 0.5B with short turns. At 1.5B, vLLM's window
+  defaulted to the model's maximum, and full-vocabulary logits for several multi-turn
+  completions in one pass don't fit beside colocated vLLM on 16 GB.
+- **Mitigation:** `vllm_max_model_length=8192` (an episode's worst case is about 7,000 tokens),
+  one rollout per forward pass with gradient accumulation over the group, gradient
+  checkpointing, and `expandable_segments`. Then: 5 steps, ~22 s/step, peak 14.5 GB. The
+  gradient is unchanged: the group is still one optimizer step.
+- **What to watch:** 14.5 of 16 GB on the fake corpus. Real passages are longer, so real
+  contexts are too. Peak memory goes in the first real run's report, and it decides B7.
+- **Status:** mitigated.
+
 ## Format for each case
 
 ```
@@ -97,7 +146,8 @@ them so the first one is recognised rather than explained away.
 | Degenerate repetition | completion length rises, KL from reference rises |
 | Dodge the duplicate-query penalty by re-wording | duplicate rate near zero while queries are near-identical |
 
-The last row is not in PROJECT.md. It comes from reading the proposed contract: duplicate
-queries are counted by exact string equality, so `"Paris"` and `"Paris "` are two distinct
-queries. Raised on the types PR; if normalisation does not land, this is the first hack to
-expect.
+The last row is not in PROJECT.md. It came from reading the proposed contract, where
+duplicate queries were counted by exact string equality, so `"Paris"` and `"Paris "` were
+two distinct queries. Normalisation landed on #2 (`_normalize_query` in `types.py`), which
+closes whitespace and case. A paraphrase is still a new query, and that's what the row now
+watches.
