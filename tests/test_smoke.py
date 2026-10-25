@@ -1,8 +1,8 @@
 """P0 smoke tests. Prove the package imports and the layout matches PROJECT.md.
 
-Replaced by real tests as each phase lands. The integration test here is a
-placeholder so the Jenkins `integration` stage has something to collect; P1
-swaps it for the 5-question end-to-end run with a fake retriever.
+Replaced by real tests as each phase lands. The placeholder integration test
+that used to live here is gone: `tests/test_integration.py` is the 5-question
+end-to-end run the Jenkins `integration` stage was waiting for.
 """
 
 from __future__ import annotations
@@ -48,9 +48,3 @@ def test_package_is_typed() -> None:
 )
 def test_required_file_exists(relpath: str) -> None:
     assert (REPO_ROOT / relpath).is_file(), f"missing {relpath}"
-
-
-@pytest.mark.integration
-def test_placeholder_integration() -> None:
-    """Placeholder. P1 replaces this with the 5-question end-to-end run."""
-    assert verisearch.__version__
