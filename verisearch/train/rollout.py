@@ -17,11 +17,15 @@ that can silently misalign a mask - is unit-tested on CPU in the `[dev]`-only
 pipeline that gates every PR. `train/grpo.py` is the only place that touches the
 trainer.
 
-Two invariants, both asserted rather than assumed:
+Three invariants, all asserted rather than assumed:
 
-1. the completion stream and the mask agree with `train.masking`, which is what
+1. the context each turn was sampled from is `prompt_ids` plus the completion
+   so far - the trainer replays exactly what the policy saw. The episode's
+   token path guarantees it by construction (`env.episode.run_token_episode`)
+   and `tests/test_rollout.py` checks it for every turn of a multi-turn episode
+2. the completion stream and the mask agree with `train.masking`, which is what
    `tests/test_masking.py` blocks on
-2. every policy token carries a sampling log-probability and every injected
+3. every policy token carries a sampling log-probability and every injected
    token carries `None` - TRL neutralises those in the importance-sampling
    correction (`2683-2687`), and a number there would be a log-probability the
    policy never produced
@@ -29,13 +33,20 @@ Two invariants, both asserted rather than assumed:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
-from verisearch.env.episode import EpisodeConfig, Generation, Question, run_episode
-from verisearch.env.protocol import render_prompt
+from verisearch.env.episode import (
+    EpisodeConfig,
+    Generation,
+    Question,
+    TokenEpisode,
+    Tokenizer,
+    TokenPolicy,
+    run_token_episode,
+)
 from verisearch.train.masking import INJECTED_TOKEN, POLICY_TOKEN, completion_token_ids, loss_mask
 from verisearch.types import Retriever, Trajectory
 
@@ -52,14 +63,6 @@ __all__ = [
 
 class RolloutError(Exception):
     """Raised when a rollout cannot be assembled into a trainable payload."""
-
-
-class Tokenizer(Protocol):
-    """Enough of a tokenizer for one episode. `transformers` satisfies it."""
-
-    def encode(self, text: str) -> list[int]: ...
-
-    def decode(self, token_ids: Sequence[int]) -> str: ...
 
 
 class TokenGenerator(Protocol):
@@ -84,7 +87,7 @@ class TokenGenerator(Protocol):
 
 
 class VllmTurnPolicy:
-    """A `Policy` over a `TokenGenerator`, recording what it generated.
+    """A `TokenPolicy` over a `TokenGenerator`.
 
     One generator call per turn, one completion per call: the trainer already
     repeated each prompt `num_generations` times (`RepeatSampler`,
@@ -92,17 +95,18 @@ class VllmTurnPolicy:
     (`generation/vllm_generation.py:663`), so a rollout is one episode and the
     group is formed by the prompts TRL hands us. Confirmed by the P1 spike run.
 
-    The records are kept because `Trajectory` has nowhere to put a
-    log-probability - and should not: it is a training artefact, not something
-    eval reads.
+    The context arrives as token ids and goes to vLLM as token ids, so nothing
+    here re-tokenises text. Holds no state a call changes, so one instance
+    serves every rollout in a step.
     """
 
     def __init__(self, generator: TokenGenerator, tokenizer: Tokenizer) -> None:
         self._generator = generator
         self._tokenizer = tokenizer
-        self.records: list[Generation] = []
 
-    def generate(self, prompt: str, *, stop: Sequence[str], max_new_tokens: int) -> Generation:
+    def generate_ids(
+        self, context_ids: Sequence[int], *, stop: Sequence[str], max_new_tokens: int
+    ) -> Generation:
         """Generate one turn. `stop` and `max_new_tokens` are the generator's own
         configuration in TRL (`SamplingParams` / `max_completion_length`), so they
         are checked here rather than silently ignored."""
@@ -113,22 +117,19 @@ class VllmTurnPolicy:
             msg = f"max_new_tokens must be positive, got {max_new_tokens}"
             raise RolloutError(msg)
 
-        prompt_ids = self._tokenizer.encode(prompt)
         _, completions, logprobs, _ = self._generator.generate(
-            [prompt_ids], None, num_generations=1
+            [list(context_ids)], None, num_generations=1
         )
         if len(completions) != 1:
             msg = f"expected one completion per turn, got {len(completions)}"
             raise RolloutError(msg)
 
         token_ids = tuple(completions[0])
-        generation = Generation(
+        return Generation(
             text=self._tokenizer.decode(token_ids),
             token_ids=token_ids,
             logprobs=_turn_logprobs(logprobs, token_ids),
         )
-        self.records.append(generation)
-        return generation
 
 
 def _turn_logprobs(
@@ -164,11 +165,7 @@ class RolloutPayload(BaseModel):
     logprobs: tuple[float | None, ...]
 
 
-def build_payload(
-    trajectory: Trajectory,
-    prompt_ids: Sequence[int],
-    records: Sequence[Generation],
-) -> RolloutPayload:
+def build_payload(episode: TokenEpisode) -> RolloutPayload:
     """Assemble one rollout, cross-checking against `train.masking`.
 
     The mask is built here from the turns and then compared with `loss_mask`,
@@ -176,10 +173,11 @@ def build_payload(
     paths to the same mask is the cheapest guard there is against the bug that
     does not show up in a training curve.
     """
+    trajectory = episode.trajectory
     completion: list[int] = []
     mask: list[int] = []
     logprobs: list[float | None] = []
-    queue = list(records)
+    queue = list(episode.generations)
 
     for turn in trajectory.turns:
         if not turn.token_ids:
@@ -192,7 +190,7 @@ def build_payload(
         if not queue:
             msg = (
                 f"trajectory {trajectory.question_id} has more generated turns with token ids "
-                "than the policy recorded generations"
+                "than the episode kept generations"
             )
             raise RolloutError(msg)
         record = queue.pop(0)
@@ -211,23 +209,29 @@ def build_payload(
         mask.extend([POLICY_TOKEN] * len(turn.token_ids))
         logprobs.extend(record.logprobs)
 
+    if queue:
+        msg = (
+            f"trajectory {trajectory.question_id}: {len(queue)} kept generation(s) belong to "
+            "no turn, so their tokens would be missing from the completion"
+        )
+        raise RolloutError(msg)
+
     if not completion:
         # TRL indexes `ids[-1]` on every completion to decide whether it was
         # truncated (`grpo_trainer.py:2325`), so an empty one is an IndexError
         # inside the trainer rather than a bad rollout here. The episode loop
-        # keeps even an unparseable generation, so reaching this means the
-        # generator produced no tokens at all - a misconfiguration, not a
-        # policy behaviour.
+        # keeps even an unparseable generation and refuses a turn with no
+        # tokens, so reaching this means a trajectory built by hand.
         msg = (
-            f"trajectory {trajectory.question_id} has an empty completion: the generator "
-            "returned no tokens for any turn, so there is nothing to train on"
+            f"trajectory {trajectory.question_id} has an empty completion: no turn carries "
+            "token ids, so there is nothing to train on"
         )
         raise RolloutError(msg)
 
     _check_against_masking(trajectory, completion, mask)
     return RolloutPayload(
         trajectory=trajectory,
-        prompt_ids=tuple(prompt_ids),
+        prompt_ids=episode.prompt_ids,
         completion_ids=tuple(completion),
         env_mask=tuple(mask),
         logprobs=tuple(logprobs),
@@ -257,7 +261,7 @@ def rollout_group(
     retriever: Retriever,
     config: EpisodeConfig,
     *,
-    policy_factory: Callable[[], VllmTurnPolicy],
+    policy: TokenPolicy,
     tokenizer: Tokenizer,
 ) -> list[RolloutPayload]:
     """Run one episode per question and return their payloads, in order.
@@ -265,16 +269,10 @@ def rollout_group(
     The prompts TRL hands `rollout_func` are already repeated `num_generations`
     times, so "one group" here is simply the slice it gave us: equal questions
     land next to each other and the advantage is computed over them by the
-    trainer. A fresh policy per rollout keeps each one's generation records its
-    own - sharing a policy across rollouts is how a mask ends up describing
-    another rollout's tokens.
+    trainer. `prompt_ids` come from the episode itself, so the prompt the
+    trainer replays is the one the first turn was sampled from.
     """
-    payloads: list[RolloutPayload] = []
-    for question in questions:
-        policy = policy_factory()
-        trajectory = run_episode(question, policy, retriever, config, tokenizer=tokenizer)
-        prompt_ids = tokenizer.encode(
-            render_prompt(question.question, search_budget=config.search_budget, top_k=config.top_k)
-        )
-        payloads.append(build_payload(trajectory, prompt_ids, policy.records))
-    return payloads
+    return [
+        build_payload(run_token_episode(question, policy, retriever, config, tokenizer=tokenizer))
+        for question in questions
+    ]

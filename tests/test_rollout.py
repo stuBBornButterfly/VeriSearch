@@ -20,29 +20,41 @@ from pathlib import Path
 
 import pytest
 
-from verisearch.config import PenaltyConfig, RewardConfig
-from verisearch.env.episode import EpisodeConfig, Generation, Question
+from verisearch.config import Config, PenaltyConfig, RewardConfig, load_config
+from verisearch.env.episode import EpisodeConfig, Generation, Question, TokenEpisode
 from verisearch.env.protocol import render_prompt
-from verisearch.rewards.compose import RewardSpec
-from verisearch.testing import DEFAULT_CORPUS, FakeRetriever, make_trajectory
+from verisearch.rewards.compose import RewardSpec, compose_reward
+from verisearch.testing import (
+    DEFAULT_CORPUS,
+    FakeFaithfulnessScorer,
+    FakeRetriever,
+    make_trajectory,
+)
+from verisearch.train import grpo
 from verisearch.train.grpo import (
+    RESOLVED_CONFIG_FILENAME,
     TrainError,
     TrainSummary,
     _as_float,
+    _module,
     _question_for,
+    index_prompts,
+    load_question_set,
     load_questions,
     main,
     rewards_for_trajectories,
     summarize_history,
+    write_resolved_config,
 )
 from verisearch.train.masking import completion_token_ids, loss_mask, spans
 from verisearch.train.rollout import (
     RolloutError,
+    RolloutPayload,
     VllmTurnPolicy,
     build_payload,
     rollout_group,
 )
-from verisearch.types import Termination, TurnKind
+from verisearch.types import Termination, Trajectory, TurnKind
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 QUESTION = Question(
@@ -52,76 +64,84 @@ QUESTION = Question(
 )
 
 
-class FakeTokenizer:
-    """Word-length ids. Deterministic, and distinct enough to spot misalignment."""
-
-    def encode(self, text: str) -> list[int]:
-        return [len(word) for word in text.split()]
-
-    def decode(self, token_ids: Sequence[int]) -> str:
-        return " ".join(str(token) for token in token_ids)
-
-
-class FakeGenerator:
-    """Stands in for TRL's `vllm_generation`: token ids in, ids and logprobs out."""
-
-    def __init__(self, *turns: str, logprobs: bool = True) -> None:
-        self._turns = list(turns)
-        self._logprobs = logprobs
-        self.calls: list[list[list[int]]] = []
-
-    def generate(
-        self,
-        prompts: list[list[int]],
-        images: None,
-        num_generations: int,
-    ) -> tuple[
-        list[list[int]],
-        list[list[int]],
-        list[list[list[float | None]]] | None,
-        object,
-    ]:
-        assert images is None
-        assert num_generations == 1
-        self.calls.append(prompts)
-        text = self._turns.pop(0)
-        ids = [ord(char) for char in text]
-        rows: list[list[list[float | None]]] | None = None
-        if self._logprobs:
-            rows = [[[-0.5] for _ in ids]]
-        return prompts, [ids], rows, None
-
-
-class TextGenerator(FakeGenerator):
-    """A generator whose decoded text is the script, so the parser sees real tags."""
-
-    def generate(
-        self,
-        prompts: list[list[int]],
-        images: None,
-        num_generations: int,
-    ) -> tuple[
-        list[list[int]],
-        list[list[int]],
-        list[list[list[float | None]]] | None,
-        object,
-    ]:
-        assert images is None
-        assert num_generations == 1
-        self.calls.append(prompts)
-        text = self._turns.pop(0)
-        ids = [ord(char) for char in text]
-        return prompts, [ids], [[[-0.25] for _ in ids]], None
-
-
 class CharTokenizer:
-    """Round-trips `TextGenerator`'s ids, so a turn's text is what the policy wrote."""
+    """One id per character, so decoding is exact."""
 
     def encode(self, text: str) -> list[int]:
         return [ord(char) for char in text]
 
     def decode(self, token_ids: Sequence[int]) -> str:
         return "".join(chr(token) for token in token_ids)
+
+
+class MergingTokenizer(CharTokenizer):
+    """Greedy longest match over a few multi-character pieces, like BPE merges.
+
+    The pieces straddle the joins the episode makes - `>` then a newline, a
+    newline then `<` - so encoding a decoded transcript does *not* give back the
+    ids it was spliced from. That is the property that made finding A on #31
+    possible, and this tokenizer is how the tests below would catch it coming
+    back: a re-encoded context differs from the spliced one.
+    """
+
+    PIECES = (">\n<", ">\n", "\n<")
+
+    def encode(self, text: str) -> list[int]:
+        ids: list[int] = []
+        position = 0
+        while position < len(text):
+            piece = next((p for p in self.PIECES if text.startswith(p, position)), None)
+            if piece is None:
+                ids.append(ord(text[position]))
+                position += 1
+            else:
+                ids.append(1_000_000 + self.PIECES.index(piece))
+                position += len(piece)
+        return ids
+
+    def decode(self, token_ids: Sequence[int]) -> str:
+        return "".join(
+            self.PIECES[token - 1_000_000] if token >= 1_000_000 else chr(token)
+            for token in token_ids
+        )
+
+
+class ScriptGenerator:
+    """Stands in for TRL's `vllm_generation`: token ids in, ids and logprobs out.
+
+    Each turn's text is encoded with the run's tokenizer, so the ids decode back
+    to the script and the parser sees real tags. Records every context it is
+    handed - the thing finding A was about.
+    """
+
+    def __init__(
+        self, *turns: str, tokenizer: CharTokenizer | None = None, logprobs: bool = True
+    ) -> None:
+        self._turns = list(turns)
+        self._tokenizer = tokenizer or CharTokenizer()
+        self._logprobs = logprobs
+        self.calls: list[list[int]] = []
+
+    def generate(
+        self,
+        prompts: list[list[int]],
+        images: None,
+        num_generations: int,
+    ) -> tuple[
+        list[list[int]],
+        list[list[int]],
+        list[list[list[float | None]]] | None,
+        object,
+    ]:
+        assert images is None
+        assert num_generations == 1
+        assert len(prompts) == 1
+        self.calls.append(list(prompts[0]))
+        ids = self._tokenizer.encode(self._turns.pop(0))
+        rows: list[list[list[float | None]]] | None = None
+        if self._logprobs:
+            rows = [[[-0.25] for _ in ids]]
+        return prompts, [ids], rows, None
 
 
 def config(**overrides: int) -> EpisodeConfig:
@@ -142,38 +162,90 @@ def spec() -> RewardSpec:
     )
 
 
+def _rollout(
+    *turns: str, tokenizer: CharTokenizer | None = None
+) -> tuple[RolloutPayload, ScriptGenerator]:
+    tokenizer = tokenizer or CharTokenizer()
+    generator = ScriptGenerator(*turns, tokenizer=tokenizer)
+    (payload,) = rollout_group(
+        [QUESTION],
+        FakeRetriever(),
+        config(),
+        policy=VllmTurnPolicy(generator, tokenizer),
+        tokenizer=tokenizer,
+    )
+    return payload, generator
+
+
+def _prefixes(payload: RolloutPayload) -> list[int]:
+    """Where each generated turn starts in the completion, in generation order."""
+    starts: list[int] = []
+    position = 0
+    for turn in payload.trajectory.turns:
+        if turn.generated and turn.token_ids:
+            starts.append(position)
+        position += len(turn.token_ids)
+    return starts
+
+
 # ---------------------------------------------------------------------------
 # VllmTurnPolicy
 # ---------------------------------------------------------------------------
 
 
 def test_the_policy_returns_ids_and_logprobs_together() -> None:
-    policy = VllmTurnPolicy(FakeGenerator("hi"), FakeTokenizer())
+    policy = VllmTurnPolicy(ScriptGenerator("hi"), CharTokenizer())
 
-    generation = policy.generate("prompt text", stop=("</search>",), max_new_tokens=8)
+    generation = policy.generate_ids((1, 2), stop=("</search>",), max_new_tokens=8)
 
+    assert generation.text == "hi"
     assert generation.token_ids == (ord("h"), ord("i"))
-    assert generation.logprobs == (-0.5, -0.5)
-    assert policy.records == [generation]
+    assert generation.logprobs == (-0.25, -0.25)
 
 
-def test_the_prompt_is_tokenized_before_it_reaches_the_generator() -> None:
-    """Token ids in, token ids out. No step in the loop re-tokenizes text."""
-    generator = FakeGenerator("hi")
-    policy = VllmTurnPolicy(generator, FakeTokenizer())
+def test_the_context_reaches_the_generator_as_the_ids_it_was_given() -> None:
+    """Token ids in, token ids out. Nothing re-tokenises text on the way."""
+    generator = ScriptGenerator("hi")
+    policy = VllmTurnPolicy(generator, CharTokenizer())
 
-    policy.generate("two words", stop=("</search>",), max_new_tokens=8)
+    policy.generate_ids((3, 5, 8), stop=("</search>",), max_new_tokens=8)
 
-    assert generator.calls == [[[3, 5]]]
+    assert generator.calls == [[3, 5, 8]]
 
 
 def test_a_generator_without_logprobs_is_refused() -> None:
     """GRPO needs them for the importance-sampling ratio. Zero-filling would be
     a ratio of 1 on a token that was never scored."""
-    policy = VllmTurnPolicy(FakeGenerator("hi", logprobs=False), FakeTokenizer())
+    policy = VllmTurnPolicy(ScriptGenerator("hi", logprobs=False), CharTokenizer())
 
     with pytest.raises(RolloutError, match="no logprobs"):
-        policy.generate("prompt", stop=("</search>",), max_new_tokens=8)
+        policy.generate_ids((1,), stop=("</search>",), max_new_tokens=8)
+
+
+def test_a_logprob_row_of_the_wrong_length_is_refused() -> None:
+    class Short(ScriptGenerator):
+        def generate(
+            self, prompts: list[list[int]], images: None, num_generations: int
+        ) -> tuple[list[list[int]], list[list[int]], list[list[list[float | None]]] | None, object]:
+            return prompts, [[104, 105]], [[[-0.1]]], None
+
+    with pytest.raises(RolloutError, match="logprobs cover 1 tokens"):
+        VllmTurnPolicy(Short(), CharTokenizer()).generate_ids(
+            (1,), stop=("</search>",), max_new_tokens=8
+        )
+
+
+def test_more_than_one_completion_per_turn_is_refused() -> None:
+    class Two(ScriptGenerator):
+        def generate(
+            self, prompts: list[list[int]], images: None, num_generations: int
+        ) -> tuple[list[list[int]], list[list[int]], list[list[list[float | None]]] | None, object]:
+            return prompts, [[104], [105]], [[[-0.1]], [[-0.1]]], None
+
+    with pytest.raises(RolloutError, match="one completion per turn"):
+        VllmTurnPolicy(Two(), CharTokenizer()).generate_ids(
+            (1,), stop=("</search>",), max_new_tokens=8
+        )
 
 
 @pytest.mark.parametrize(
@@ -186,10 +258,89 @@ def test_a_generator_without_logprobs_is_refused() -> None:
 def test_a_misconfigured_generator_is_refused(
     stop: tuple[str, ...], max_new_tokens: int, match: str
 ) -> None:
-    policy = VllmTurnPolicy(FakeGenerator("hi"), FakeTokenizer())
+    policy = VllmTurnPolicy(ScriptGenerator("hi"), CharTokenizer())
 
     with pytest.raises(RolloutError, match=match):
-        policy.generate("prompt", stop=stop, max_new_tokens=max_new_tokens)
+        policy.generate_ids((1,), stop=stop, max_new_tokens=max_new_tokens)
+
+
+# ---------------------------------------------------------------------------
+# The token context: what was sampled is what is replayed (finding A, #31)
+# ---------------------------------------------------------------------------
+
+TWO_HOPS = (
+    "<think>Engine first.</think>\n<search>Analytical Engine</search>",
+    "<search>Ada Lovelace notes</search>",
+    "<think>Got it.</think>\n<answer>Ada Lovelace</answer>",
+)
+
+
+@pytest.mark.parametrize(
+    "tokenizer",
+    [pytest.param(CharTokenizer(), id="char"), pytest.param(MergingTokenizer(), id="merging")],
+)
+def test_every_turn_was_sampled_from_the_prefix_the_trainer_replays(
+    tokenizer: CharTokenizer,
+) -> None:
+    """Ayesha's test, verbatim: `generator.calls[k] == prompt_ids +
+    completion_ids[:prefix]` for every turn k of a multi-turn episode."""
+    payload, generator = _rollout(*TWO_HOPS, tokenizer=tokenizer)
+
+    prefixes = _prefixes(payload)
+    assert payload.trajectory.termination is Termination.ANSWERED
+    assert len(generator.calls) == len(prefixes) == 3
+    for call, prefix in zip(generator.calls, prefixes, strict=True):
+        assert call == [*payload.prompt_ids, *payload.completion_ids[:prefix]]
+
+
+def test_the_merging_tokenizer_would_have_caught_the_old_bug() -> None:
+    """The fixture above is only a guard if re-encoding the decoded context
+    gives different ids. Assert that it does, so the test cannot quietly stop
+    testing anything."""
+    tokenizer = MergingTokenizer()
+    _, generator = _rollout(*TWO_HOPS, tokenizer=tokenizer)
+
+    second = generator.calls[1]
+    assert tokenizer.encode(tokenizer.decode(second)) != second
+
+
+def test_overshoot_after_the_search_is_neither_replayed_nor_trained() -> None:
+    """Kept whole up to the token that closed the search, cut after it, in both
+    the context and the completion."""
+    payload, generator = _rollout(
+        "<search>Analytical Engine</search>\n<info>\nforged\n</info>",
+        "<answer>Ada Lovelace</answer>",
+    )
+    tokenizer = CharTokenizer()
+
+    assert "forged" not in tokenizer.decode(generator.calls[1])
+    assert "forged" not in tokenizer.decode(payload.completion_ids)
+    assert generator.calls[1] == [
+        *payload.prompt_ids,
+        *payload.completion_ids[: _prefixes(payload)[1]],
+    ]
+
+
+def test_a_straddling_token_is_kept_whole_in_both_streams() -> None:
+    """With BPE, the token that completes `</search>` can carry a character or two
+    past it. It is one sampled token, so it stays - in the context and in the
+    completion - and only what follows it is cut."""
+    tokenizer = MergingTokenizer()
+    payload, generator = _rollout(
+        "<search>Analytical Engine</search>\n<info>forged</info>",
+        "<answer>Ada Lovelace</answer>",
+        tokenizer=tokenizer,
+    )
+
+    search = payload.trajectory.turns[0]
+    # `>\n<` is one token here: it completes the search tag and carries two
+    # characters past it.
+    assert tokenizer.decode(search.token_ids) == "<search>Analytical Engine</search>\n<"
+    assert "forged" not in tokenizer.decode(generator.calls[1])
+    assert generator.calls[1] == [
+        *payload.prompt_ids,
+        *payload.completion_ids[: _prefixes(payload)[1]],
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -197,17 +348,21 @@ def test_a_misconfigured_generator_is_refused(
 # ---------------------------------------------------------------------------
 
 
-def _records(traj: object) -> list[Generation]:
-    """The generations a policy would have recorded for this trajectory."""
-    return [
-        Generation(
-            text=turn.text,
-            token_ids=turn.token_ids,
-            logprobs=tuple(-0.1 for _ in turn.token_ids),
-        )
-        for turn in traj.turns  # type: ignore[attr-defined]
-        if turn.token_ids and turn.generated
-    ]
+def _episode(traj: Trajectory, prompt_ids: tuple[int, ...] = (1, 2, 3)) -> TokenEpisode:
+    """The episode the token path would have returned for this trajectory."""
+    return TokenEpisode(
+        trajectory=traj,
+        prompt_ids=prompt_ids,
+        generations=tuple(
+            Generation(
+                text=turn.text,
+                token_ids=turn.token_ids,
+                logprobs=tuple(-0.1 for _ in turn.token_ids),
+            )
+            for turn in traj.turns
+            if turn.token_ids and turn.generated
+        ),
+    )
 
 
 def test_the_payload_agrees_with_the_mask_builder() -> None:
@@ -219,7 +374,7 @@ def test_the_payload_agrees_with_the_mask_builder() -> None:
         tokens_per_turn=3,
     )
 
-    payload = build_payload(traj, (1, 2, 3), _records(traj))
+    payload = build_payload(_episode(traj))
 
     assert payload.completion_ids == completion_token_ids(traj)
     assert payload.env_mask == loss_mask(traj)
@@ -233,7 +388,7 @@ def test_injected_tokens_carry_no_logprob_and_policy_tokens_do() -> None:
         searches=("one",), passages_per_search=[DEFAULT_CORPUS[:1]], tokens_per_turn=2
     )
 
-    payload = build_payload(traj, (1,), _records(traj))
+    payload = build_payload(_episode(traj))
 
     assert len(payload.logprobs) == len(payload.completion_ids)
     for value, mask in zip(payload.logprobs, payload.env_mask, strict=True):
@@ -241,28 +396,53 @@ def test_injected_tokens_carry_no_logprob_and_policy_tokens_do() -> None:
 
 
 def test_a_mismatched_generation_is_refused() -> None:
-    """If a record's ids are not the turn's ids, the mask describes different
+    """If a generation's ids are not the turn's ids, the mask describes different
     tokens than the ones being trained on."""
-    traj = make_trajectory(searches=("one",), tokens_per_turn=2)
-    wrong = [record.model_copy(update={"token_ids": (999, 998)}) for record in _records(traj)]
+    episode = _episode(make_trajectory(searches=("one",), tokens_per_turn=2))
+    wrong = tuple(g.model_copy(update={"token_ids": (999, 998)}) for g in episode.generations)
 
     with pytest.raises(RolloutError, match="do not match"):
-        build_payload(traj, (1,), wrong)
+        build_payload(episode.model_copy(update={"generations": wrong}))
 
 
-def test_too_few_records_is_refused() -> None:
-    traj = make_trajectory(searches=("one", "two"), tokens_per_turn=2)
+def test_too_few_generations_is_refused() -> None:
+    episode = _episode(make_trajectory(searches=("one", "two"), tokens_per_turn=2))
 
     with pytest.raises(RolloutError, match="more generated turns"):
-        build_payload(traj, (1,), _records(traj)[:1])
+        build_payload(episode.model_copy(update={"generations": episode.generations[:1]}))
 
 
-def test_a_record_missing_logprobs_is_refused() -> None:
-    traj = make_trajectory(searches=("one",), tokens_per_turn=2)
-    stripped = [record.model_copy(update={"logprobs": ()}) for record in _records(traj)]
+def test_a_generation_that_belongs_to_no_turn_is_refused() -> None:
+    episode = _episode(make_trajectory(searches=("one",), tokens_per_turn=2))
+    extra = (*episode.generations, Generation(text="x", token_ids=(7,), logprobs=(-0.1,)))
+
+    with pytest.raises(RolloutError, match="belong to no turn"):
+        build_payload(episode.model_copy(update={"generations": extra}))
+
+
+def test_a_generation_missing_logprobs_is_refused() -> None:
+    episode = _episode(make_trajectory(searches=("one",), tokens_per_turn=2))
+    stripped = tuple(g.model_copy(update={"logprobs": ()}) for g in episode.generations)
 
     with pytest.raises(RolloutError, match="logprobs for"):
-        build_payload(traj, (1,), stripped)
+        build_payload(episode.model_copy(update={"generations": stripped}))
+
+
+def test_a_payload_that_disagrees_with_the_mask_builder_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cross-check itself: if `train.masking` and the payload ever disagree,
+    neither failure would show in a training curve, so the rollout stops."""
+    from verisearch.train import rollout
+
+    episode = _episode(make_trajectory(searches=("one",), tokens_per_turn=2))
+    monkeypatch.setattr(rollout, "loss_mask", lambda traj: (1,) * len(completion_token_ids(traj)))
+    with pytest.raises(RolloutError, match="env_mask disagrees"):
+        build_payload(episode)
+
+    monkeypatch.setattr(rollout, "completion_token_ids", lambda traj: (0,))
+    with pytest.raises(RolloutError, match="completion disagrees"):
+        build_payload(episode)
 
 
 # ---------------------------------------------------------------------------
@@ -273,15 +453,13 @@ def test_a_record_missing_logprobs_is_refused() -> None:
 def test_a_group_is_one_episode_per_prompt() -> None:
     """TRL repeats each prompt `num_generations` times before calling us, so a
     rollout is one episode and the group is the slice we were handed."""
-    questions = [QUESTION] * 4
+    tokenizer = CharTokenizer()
     payloads = rollout_group(
-        questions,
+        [QUESTION] * 4,
         FakeRetriever(),
         config(),
-        policy_factory=lambda: VllmTurnPolicy(
-            TextGenerator("<answer>Ada Lovelace</answer>"), CharTokenizer()
-        ),
-        tokenizer=CharTokenizer(),
+        policy=VllmTurnPolicy(ScriptGenerator(*["<answer>Ada Lovelace</answer>"] * 4), tokenizer),
+        tokenizer=tokenizer,
     )
 
     assert len(payloads) == 4
@@ -290,21 +468,7 @@ def test_a_group_is_one_episode_per_prompt() -> None:
 
 
 def test_a_real_two_hop_rollout_masks_only_the_injected_passages() -> None:
-    payloads = rollout_group(
-        [QUESTION],
-        FakeRetriever(),
-        config(),
-        policy_factory=lambda: VllmTurnPolicy(
-            TextGenerator(
-                "<search>Analytical Engine</search>",
-                "<search>Ada Lovelace notes</search>",
-                "<answer>Ada Lovelace</answer>",
-            ),
-            CharTokenizer(),
-        ),
-        tokenizer=CharTokenizer(),
-    )
-    payload = payloads[0]
+    payload, _ = _rollout(*TWO_HOPS)
     traj = payload.trajectory
 
     assert traj.n_searches == 2
@@ -320,26 +484,12 @@ def test_a_real_two_hop_rollout_masks_only_the_injected_passages() -> None:
     assert 0.0 < sum(payload.env_mask) / len(payload.env_mask) < 1.0
 
 
-def test_each_rollout_gets_its_own_policy() -> None:
-    """Sharing one policy across rollouts is how a mask ends up describing
-    another rollout's tokens."""
-    made: list[VllmTurnPolicy] = []
+def test_the_prompt_ids_are_the_ones_the_first_turn_was_sampled_from() -> None:
+    payload, generator = _rollout("<answer>Ada Lovelace</answer>")
 
-    def factory() -> VllmTurnPolicy:
-        policy = VllmTurnPolicy(TextGenerator("<answer>Ada Lovelace</answer>"), CharTokenizer())
-        made.append(policy)
-        return policy
-
-    rollout_group(
-        [QUESTION, QUESTION],
-        FakeRetriever(),
-        config(),
-        policy_factory=factory,
-        tokenizer=CharTokenizer(),
-    )
-
-    assert len(made) == 2
-    assert all(len(policy.records) == 1 for policy in made)
+    prompt = render_prompt(QUESTION.question, search_budget=2, top_k=2)
+    assert payload.prompt_ids == tuple(CharTokenizer().encode(prompt))
+    assert generator.calls[0] == list(payload.prompt_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +560,7 @@ def _posix_bash() -> str | None:
     return next((str(path) for path in _GIT_BASH if path.is_file()), None)
 
 
-def _run_script(*args: str) -> subprocess.CompletedProcess[str]:
+def _run_script(*args: str, **env: str) -> subprocess.CompletedProcess[str]:
     """Run `scripts/02_train.sh` the way Jenkins does: through bash, not `uv run`.
 
     The environment is inherited rather than replaced - the previous version set
@@ -434,6 +584,7 @@ def _run_script(*args: str) -> subprocess.CompletedProcess[str]:
             **os.environ,
             "PYTHON": Path(sys.executable).as_posix(),
             "WANDB_MODE": "offline",
+            **env,
         },
     )
 
@@ -449,6 +600,18 @@ def test_the_nightly_invocation_works() -> None:
     assert "steps        5" in result.stdout
     assert "retriever    FakeRetriever" in result.stdout
     assert "stopping before the trainer" in result.stdout
+
+
+@pytest.mark.integration
+def test_the_script_takes_a_sampled_set_of_question_files(tmp_path: Path) -> None:
+    """Section 7's mix: several files, the same number drawn from each."""
+    hotpot = _question_file(tmp_path / "h.jsonl", "h", 10)
+    wiki = _question_file(tmp_path / "w.jsonl", "w", 10)
+
+    result = _run_script("--plan", QUESTIONS=f"{hotpot.as_posix()} {wiki.as_posix()}", PER_FILE="3")
+
+    assert result.returncode == 0, result.stderr
+    assert "questions    6" in result.stdout
 
 
 @pytest.mark.integration
@@ -566,7 +729,7 @@ def test_an_empty_completion_is_refused_with_our_own_message() -> None:
     empty = traj.model_copy(update={"turns": ()})
 
     with pytest.raises(RolloutError, match="empty completion"):
-        build_payload(empty, (1, 2), [])
+        build_payload(TokenEpisode(trajectory=empty, prompt_ids=(1, 2), generations=()))
 
 
 def test_the_summary_prefers_the_per_step_loss() -> None:
@@ -601,3 +764,260 @@ def test_a_history_with_nothing_usable_is_nan_not_zero() -> None:
 
     assert math.isnan(summary.final_loss)
     assert summary.loss_is_finite is False
+
+
+# ---------------------------------------------------------------------------
+# The training set (section 7: HotpotQA plus 2WikiMultihopQA, sampled)
+# ---------------------------------------------------------------------------
+
+
+def _question_file(path: Path, prefix: str, n: int, *, answers: bool = True) -> Path:
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "question_id": f"{prefix}{i}",
+                    "question": f"{prefix} question {i}?",
+                    "answers": ["a"] if answers else [],
+                }
+            )
+            + "\n"
+            for i in range(n)
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_set_reads_every_file_in_order(tmp_path: Path) -> None:
+    hotpot = _question_file(tmp_path / "h.jsonl", "h", 3)
+    wiki = _question_file(tmp_path / "w.jsonl", "w", 2)
+
+    questions = load_question_set([hotpot, wiki], seed=42)
+
+    assert [q.question_id for q in questions] == ["h0", "h1", "h2", "w0", "w1"]
+
+
+def test_per_file_draws_the_same_number_from_each_file_whatever_their_sizes(
+    tmp_path: Path,
+) -> None:
+    hotpot = _question_file(tmp_path / "h.jsonl", "h", 50)
+    wiki = _question_file(tmp_path / "w.jsonl", "w", 500)
+
+    questions = load_question_set([hotpot, wiki], per_file=10, seed=42)
+
+    assert sum(q.question_id.startswith("h") for q in questions) == 10
+    assert sum(q.question_id.startswith("w") for q in questions) == 10
+
+
+def test_the_draw_is_a_function_of_the_seed(tmp_path: Path) -> None:
+    """A rerun of a sweep point has to train on the same questions."""
+    source = _question_file(tmp_path / "h.jsonl", "h", 200)
+
+    first = load_question_set([source], per_file=20, seed=42)
+    again = load_question_set([source], per_file=20, seed=42)
+    other = load_question_set([source], per_file=20, seed=7)
+
+    assert first == again
+    assert first != other
+
+
+def test_limit_keeps_the_first_n_of_the_set(tmp_path: Path) -> None:
+    """The overfit-20 run: the same twenty, every time."""
+    source = _question_file(tmp_path / "h.jsonl", "h", 30)
+
+    assert [q.question_id for q in load_question_set([source], seed=1, limit=2)] == ["h0", "h1"]
+
+
+@pytest.mark.parametrize(
+    ("per_file", "match"),
+    [pytest.param(0, "at least 1", id="zero"), pytest.param(99, "fewer than", id="too-many")],
+)
+def test_an_impossible_draw_is_refused(tmp_path: Path, per_file: int, match: str) -> None:
+    source = _question_file(tmp_path / "h.jsonl", "h", 5)
+
+    with pytest.raises(TrainError, match=match):
+        load_question_set([source], per_file=per_file, seed=1)
+
+
+def test_a_set_with_no_files_or_an_empty_file_is_refused(tmp_path: Path) -> None:
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("\n", encoding="utf-8")
+
+    with pytest.raises(TrainError, match="no question files"):
+        load_question_set([], seed=1)
+    with pytest.raises(TrainError, match="no questions"):
+        load_question_set([empty], seed=1)
+
+
+def test_a_question_without_a_gold_answer_is_refused(tmp_path: Path) -> None:
+    """`Question` allows none for the policy server; training cannot score it."""
+    source = _question_file(tmp_path / "h.jsonl", "h", 2, answers=False)
+
+    with pytest.raises(TrainError, match="h0 has no gold answer"):
+        load_question_set([source], seed=1)
+    with pytest.raises(TrainError, match="no gold answer"):
+        load_questions(source)
+
+
+def test_same_text_with_different_answers_is_refused() -> None:
+    """One would be scored against the other's gold answers."""
+    questions = [
+        Question(question_id="a", question="Who wrote it?", gold_answers=("Ada",)),
+        Question(question_id="b", question="Who wrote it?", gold_answers=("Grace",)),
+    ]
+
+    with pytest.raises(TrainError, match="a and b have the same text"):
+        index_prompts(questions, load_config())
+
+
+def test_an_exact_duplicate_is_kept_once() -> None:
+    questions = [
+        Question(question_id="a", question="Who wrote it?", gold_answers=("Ada",)),
+        Question(question_id="b", question="Who wrote it?", gold_answers=("Ada",)),
+    ]
+
+    by_prompt = index_prompts(questions, load_config())
+
+    assert [q.question_id for q in by_prompt.values()] == ["a"]
+
+
+# ---------------------------------------------------------------------------
+# The run directory describes itself (#34)
+# ---------------------------------------------------------------------------
+
+
+def test_the_resolved_config_round_trips(tmp_path: Path) -> None:
+    config = load_config().with_lambda(0.02)
+
+    path = write_resolved_config(config, tmp_path / "run")
+
+    assert path == tmp_path / "run" / RESOLVED_CONFIG_FILENAME
+    reread = Config.model_validate_json(path.read_text(encoding="utf-8"))
+    assert reread == config
+    assert reread.reward.lambda_retrieval_cost == 0.02
+    assert reread.env.search_budget == config.env.search_budget
+
+
+def _fake_training(
+    loss: float,
+) -> tuple[list[tuple[Config, Path]], object]:
+    seen: list[tuple[Config, Path]] = []
+
+    def run_training(
+        config: Config,
+        questions: Sequence[Question],
+        retriever: object,
+        *,
+        output_dir: Path,
+        max_steps: int,
+    ) -> TrainSummary:
+        assert questions
+        # Written before the trainer starts, so a run that dies still says
+        # what it was.
+        assert (output_dir / RESOLVED_CONFIG_FILENAME).is_file()
+        seen.append((config, output_dir))
+        return TrainSummary(
+            steps=max_steps, final_loss=loss, mean_reward=-0.5, output_dir=str(output_dir)
+        )
+
+    return seen, run_training
+
+
+def test_a_run_writes_its_config_before_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen, fake = _fake_training(0.1)
+    monkeypatch.setattr(grpo, "run_training", fake)
+    out = tmp_path / "lambda-0.02"
+
+    code = main(["--smoke", "--steps", "1", "--out", str(out), "--lambda-cost", "0.02"])
+
+    assert code == 0
+    assert "RESULT: PASS" in capsys.readouterr().out
+    written = Config.model_validate_json((out / RESOLVED_CONFIG_FILENAME).read_text("utf-8"))
+    assert written.reward.lambda_retrieval_cost == 0.02
+    assert seen == [(written, out)]
+
+
+def test_a_non_finite_loss_fails_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, fake = _fake_training(float("nan"))
+    monkeypatch.setattr(grpo, "run_training", fake)
+
+    assert main(["--smoke", "--steps", "1", "--out", str(tmp_path / "run")]) == 1
+    assert "FAIL: the loss is not finite" in capsys.readouterr().out
+
+
+def test_plan_mode_writes_nothing(tmp_path: Path) -> None:
+    out = tmp_path / "run"
+
+    assert main(["--smoke", "--plan", "--out", str(out)]) == 0
+    assert not out.exists()
+
+
+def test_a_real_run_reads_the_question_set_and_the_service(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The non-smoke path, stopped at `--plan`: two files, sampled per file."""
+    hotpot = _question_file(tmp_path / "h.jsonl", "h", 30)
+    wiki = _question_file(tmp_path / "w.jsonl", "w", 30)
+
+    code = main(["--plan", "--questions", str(hotpot), str(wiki), "--per-file", "5"])
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "questions    10" in out
+    assert "retriever    HttpRetriever" in out
+    assert "faithfulness off" in out
+    assert f"config       {load_config().fingerprint}" in out
+
+
+# ---------------------------------------------------------------------------
+# Faithfulness in the reward (finding B on #31)
+# ---------------------------------------------------------------------------
+
+
+def test_without_a_scorer_faithfulness_contributes_nothing() -> None:
+    """Finding B as it stands: the term is 0.0 for every rollout, so `w_a` never
+    reaches the policy. With a scorer it is `w_a` times the score."""
+    supported = make_trajectory(
+        searches=("Ada Lovelace",), passages_per_search=[DEFAULT_CORPUS[:2]], answer="Ada Lovelace"
+    )
+    scorer = FakeFaithfulnessScorer()
+
+    (without,) = rewards_for_trajectories([supported], spec())
+    (with_scorer,) = rewards_for_trajectories([supported], spec(), scorer=scorer)
+
+    assert without == compose_reward(supported, spec()).total
+    score = scorer.score("Ada Lovelace", supported.retrieved_passages).score
+    assert with_scorer - without == pytest.approx(0.5 * score)
+    assert score > 0.0
+
+
+def test_with_a_scorer_a_supported_answer_beats_an_unsupported_one() -> None:
+    """Same correctness, same searches; only what the passages say differs."""
+    passages = [DEFAULT_CORPUS[:2]]
+    supported = make_trajectory(
+        searches=("Ada Lovelace",), passages_per_search=passages, answer="Ada Lovelace"
+    )
+    unsupported = make_trajectory(
+        searches=("Ada Lovelace",),
+        passages_per_search=passages,
+        answer="Ada Lovelace, who sailed to Neptune",
+    )
+    scorer = FakeFaithfulnessScorer()
+
+    scored = rewards_for_trajectories([supported, unsupported], spec(), scorer=scorer)
+    unscored = rewards_for_trajectories([supported, unsupported], spec())
+
+    assert scored[0] - scored[1] > unscored[0] - unscored[1]
+
+
+def test_train_only_dependencies_import_by_name() -> None:
+    """`trl`, `torch` and `peft` are imported through this, lazily, so a CPU-only
+    install can still import the module and run everything above."""
+    assert _module("json") is json
+    with pytest.raises(TrainError, match="needs the \\[train\\] extra"):
+        _module("verisearch_no_such_module")
