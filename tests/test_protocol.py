@@ -12,6 +12,7 @@ from verisearch.env.protocol import (
     Tag,
     check_stop_sequences,
     render_info,
+    render_injection,
     render_prompt,
 )
 from verisearch.types import Passage
@@ -66,6 +67,14 @@ def test_no_hits_says_so_in_words() -> None:
     """An empty `<info></info>` block reads like no search happened. The policy
     has to be able to tell 'I searched and found nothing' apart from that."""
     assert render_info(()) == f"<info>\n{NO_RESULTS}\n</info>"
+
+
+def test_the_injection_carries_its_own_separators() -> None:
+    """Finding A on #31: the newlines around the block are part of what is
+    injected, so an `INFO` turn's text and its ids describe the same characters."""
+    passages = _passages(1)
+
+    assert render_injection(passages) == f"\n{render_info(passages)}\n"
 
 
 def test_render_info_is_deterministic() -> None:
