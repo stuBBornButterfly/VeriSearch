@@ -14,11 +14,13 @@ import pytest
 from verisearch.config import load_config
 from verisearch.env.episode import (
     EpisodeConfig,
+    EpisodeError,
     Generation,
     Question,
     run_episode,
+    run_token_episode,
 )
-from verisearch.env.protocol import NO_RESULTS, ProtocolError
+from verisearch.env.protocol import NO_RESULTS, ProtocolError, render_prompt
 from verisearch.testing import FakeRetriever
 from verisearch.types import ParseFailure, Passage, Termination, TurnKind
 
@@ -60,15 +62,41 @@ class ScriptedPolicy:
         return Generation(text=text, token_ids=ids)
 
 
-class CountingTokenizer:
-    """Deterministic byte-ish tokenizer. Only needs to be stable, not realistic."""
+class CharTokenizer:
+    """One id per character, so decoding is exact. Records what it encodes."""
 
     def __init__(self) -> None:
         self.calls: list[str] = []
 
     def encode(self, text: str) -> list[int]:
         self.calls.append(text)
-        return [len(word) for word in text.split()]
+        return [ord(char) for char in text]
+
+    def decode(self, token_ids: Sequence[int]) -> str:
+        return "".join(chr(token) for token in token_ids)
+
+
+class ScriptedTokenPolicy:
+    """The token path's scripted policy: ids in, the script's ids out.
+
+    Records every context it is handed, which is what the token-context
+    invariant is asserted against.
+    """
+
+    def __init__(self, *generations: str, tokenizer: CharTokenizer | None = None) -> None:
+        self._generations = list(generations)
+        self._tokenizer = tokenizer or CharTokenizer()
+        self.contexts: list[tuple[int, ...]] = []
+
+    def generate_ids(
+        self, context_ids: Sequence[int], *, stop: Sequence[str], max_new_tokens: int
+    ) -> Generation:
+        assert stop
+        assert max_new_tokens > 0
+        self.contexts.append(tuple(context_ids))
+        text = self._generations.pop(0)
+        ids = tuple(ord(char) for char in text)
+        return Generation(text=text, token_ids=ids, logprobs=tuple(-0.5 for _ in ids))
 
 
 def config(**overrides: int) -> EpisodeConfig:
@@ -172,7 +200,8 @@ def test_an_empty_query_costs_budget_and_the_episode_continues() -> None:
     assert traj.termination is Termination.ANSWERED
     assert traj.n_searches == 1
     assert retriever.n_searches == 0, "a blank query is not worth a retrieval call"
-    assert traj.turns[1].text == f"<info>\n{NO_RESULTS}\n</info>"
+    # Exactly what was injected, separators included (finding A on #31).
+    assert traj.turns[1].text == f"\n<info>\n{NO_RESULTS}\n</info>\n"
 
 
 def test_a_search_with_no_hits_still_injects_a_turn() -> None:
@@ -278,50 +307,99 @@ def test_a_stop_set_that_would_corrupt_the_signal_is_refused() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Token ids: optional at P1, load-bearing at P3
+# Token ids: none on the text path, load-bearing on the token path
 # ---------------------------------------------------------------------------
 
 
-def test_without_a_tokenizer_turns_carry_text_only(fake_retriever: FakeRetriever) -> None:
-    policy = ScriptedPolicy("<search>Ada Lovelace</search>", "<answer>Ada Lovelace</answer>")
+def test_the_text_path_carries_text_only(fake_retriever: FakeRetriever) -> None:
+    """Even when the policy returns ids: nothing on the text path can tokenise
+    the injected blocks to match them, and half-tokenised trajectories are the
+    shape `train/masking.py` refuses."""
+    policy = ScriptedPolicy(
+        "<search>Ada Lovelace</search>", "<answer>Ada Lovelace</answer>", token_ids_per_turn=5
+    )
 
     traj = run_episode(QUESTION, policy, fake_retriever, config())
 
     assert all(turn.token_ids == () for turn in traj.turns)
 
 
-def test_with_both_every_turn_that_has_text_has_ids(fake_retriever: FakeRetriever) -> None:
+def test_on_the_token_path_every_turn_that_has_text_has_ids(
+    fake_retriever: FakeRetriever,
+) -> None:
     """This is what makes `train/masking.py` a pure function of a trajectory."""
-    policy = ScriptedPolicy(
-        "<search>Ada Lovelace</search>",
-        "<answer>Ada Lovelace</answer>",
-        token_ids_per_turn=5,
-    )
-    tokenizer = CountingTokenizer()
+    tokenizer = CharTokenizer()
+    policy = ScriptedTokenPolicy("<search>Ada Lovelace</search>", "<answer>Ada Lovelace</answer>")
 
-    traj = run_episode(QUESTION, policy, fake_retriever, config(), tokenizer=tokenizer)
+    episode = run_token_episode(QUESTION, policy, fake_retriever, config(), tokenizer=tokenizer)
+    traj = episode.trajectory
 
     assert [t.kind for t in traj.turns] == [TurnKind.SEARCH, TurnKind.INFO, TurnKind.ANSWER]
-    assert traj.turns[0].token_ids == (100, 101, 102, 103, 104)
-    assert traj.turns[1].token_ids == tuple(len(w) for w in traj.turns[1].text.split())
-    assert traj.turns[2].token_ids == (200, 201, 202, 203, 204)
+    assert traj.turns[0].token_ids == tuple(ord(c) for c in "<search>Ada Lovelace</search>")
+    assert traj.turns[1].token_ids == tuple(ord(c) for c in traj.turns[1].text)
+    assert traj.turns[2].token_ids == tuple(ord(c) for c in "<answer>Ada Lovelace</answer>")
+    assert [g.token_ids for g in episode.generations] == [
+        traj.turns[0].token_ids,
+        traj.turns[2].token_ids,
+    ]
 
 
-def test_the_tokenizer_encodes_the_injected_text_once_and_exactly(
+def test_the_prompt_and_each_injected_block_are_encoded_once_and_exactly(
     fake_retriever: FakeRetriever,
 ) -> None:
     """The ids stored on the INFO turn must be the ids of the text that was
-    injected. Re-tokenising a decoded transcript later shifts boundaries and
-    misaligns the mask - the failure KICKOFF.md warns about."""
-    policy = ScriptedPolicy(
-        "<search>Ada Lovelace</search>", "<answer>Ada</answer>", token_ids_per_turn=2
+    injected, and the prompt is encoded once, up front. Nothing re-encodes a
+    decoded transcript - the failure KICKOFF.md warns about."""
+    tokenizer = CharTokenizer()
+    policy = ScriptedTokenPolicy("<search>Ada Lovelace</search>", "<answer>Ada</answer>")
+
+    episode = run_token_episode(QUESTION, policy, fake_retriever, config(), tokenizer=tokenizer)
+
+    prompt = render_prompt(QUESTION.question, search_budget=2, top_k=2)
+    info_turns = [t for t in episode.trajectory.turns if t.kind is TurnKind.INFO]
+    assert tokenizer.calls == [prompt, *(t.text for t in info_turns)]
+    assert episode.prompt_ids == tuple(ord(c) for c in prompt)
+
+
+def test_each_turn_is_sampled_from_the_prompt_plus_every_earlier_turns_ids(
+    fake_retriever: FakeRetriever,
+) -> None:
+    """Finding A on #31, the invariant itself: the context turn k was sampled
+    from is exactly the prefix the trainer replays in front of it."""
+    policy = ScriptedTokenPolicy(
+        "<think>Engine first.</think><search>Analytical Engine</search>",
+        "<search>Ada Lovelace notes</search>",
+        "<answer>Ada Lovelace</answer>",
     )
-    tokenizer = CountingTokenizer()
 
-    traj = run_episode(QUESTION, policy, fake_retriever, config(), tokenizer=tokenizer)
+    episode = run_token_episode(
+        QUESTION, policy, fake_retriever, config(), tokenizer=CharTokenizer()
+    )
 
-    info_turns = [t for t in traj.turns if t.kind is TurnKind.INFO]
-    assert tokenizer.calls == [t.text for t in info_turns]
+    turns = episode.trajectory.turns
+    acting = [i for i, turn in enumerate(turns) if turn.generated and turn.token_ids]
+    assert len(acting) == len(policy.contexts) == 3
+    for index, context in zip(acting, policy.contexts, strict=True):
+        before = tuple(token for turn in turns[:index] for token in turn.token_ids)
+        assert context == episode.prompt_ids + before
+
+
+def test_overshoot_is_cut_from_both_streams(fake_retriever: FakeRetriever) -> None:
+    """A fabricated `<info>` after `</search>` neither reaches the next turn's
+    context nor carries loss: the search turn's ids stop where the search did."""
+    policy = ScriptedTokenPolicy(
+        "<search>Ada Lovelace</search>\n<info>\nfabricated\n</info>",
+        "<answer>Ada Lovelace</answer>",
+    )
+    tokenizer = CharTokenizer()
+
+    episode = run_token_episode(QUESTION, policy, fake_retriever, config(), tokenizer=tokenizer)
+
+    search = episode.trajectory.turns[0]
+    assert tokenizer.decode(search.token_ids) == "<search>Ada Lovelace</search>"
+    assert episode.generations[0].token_ids == search.token_ids
+    assert len(episode.generations[0].logprobs) == len(search.token_ids)
+    assert "fabricated" not in tokenizer.decode(policy.contexts[1])
 
 
 def test_ids_attach_to_the_acting_turn_when_a_turn_has_several(
@@ -330,17 +408,57 @@ def test_ids_attach_to_the_acting_turn_when_a_turn_has_several(
     """A generation covering `<think>` and `<search>` gives one id sequence. It
     lands on the acting turn rather than being split across both, because the
     policy never told us where the boundary is."""
-    policy = ScriptedPolicy(
+    policy = ScriptedTokenPolicy(
         "<think>Let me look.</think><search>Ada Lovelace</search>",
         "<answer>Ada Lovelace</answer>",
-        token_ids_per_turn=3,
     )
 
-    traj = run_episode(QUESTION, policy, fake_retriever, config(), tokenizer=CountingTokenizer())
+    traj = run_token_episode(
+        QUESTION, policy, fake_retriever, config(), tokenizer=CharTokenizer()
+    ).trajectory
 
     assert traj.turns[0].kind is TurnKind.THINK
     assert traj.turns[0].token_ids == ()
-    assert traj.turns[1].token_ids == (100, 101, 102)
+    assert CharTokenizer().decode(traj.turns[1].token_ids) == (
+        "<think>Let me look.</think><search>Ada Lovelace</search>"
+    )
+
+
+def test_a_token_policy_that_returns_no_tokens_is_refused() -> None:
+    class Silent:
+        def generate_ids(
+            self, context_ids: Sequence[int], *, stop: Sequence[str], max_new_tokens: int
+        ) -> Generation:
+            return Generation(text="")
+
+    with pytest.raises(EpisodeError, match="no tokens"):
+        run_token_episode(QUESTION, Silent(), FakeRetriever(), config(), tokenizer=CharTokenizer())
+
+
+def test_text_that_is_not_its_ids_is_refused() -> None:
+    """The parser reads the text and the trainer reads the ids; if they disagree
+    the turn boundaries describe tokens the trainer never sees."""
+
+    class Liar:
+        def generate_ids(
+            self, context_ids: Sequence[int], *, stop: Sequence[str], max_new_tokens: int
+        ) -> Generation:
+            return Generation(text="<answer>Ada</answer>", token_ids=(1, 2, 3))
+
+    with pytest.raises(EpisodeError, match="not the decoding"):
+        run_token_episode(QUESTION, Liar(), FakeRetriever(), config(), tokenizer=CharTokenizer())
+
+
+def test_logprobs_that_do_not_line_up_with_the_ids_are_refused() -> None:
+    class Short:
+        def generate_ids(
+            self, context_ids: Sequence[int], *, stop: Sequence[str], max_new_tokens: int
+        ) -> Generation:
+            text = "<answer>Ada</answer>"
+            return Generation(text=text, token_ids=tuple(map(ord, text)), logprobs=(-0.1,))
+
+    with pytest.raises(EpisodeError, match="paired by position"):
+        run_token_episode(QUESTION, Short(), FakeRetriever(), config(), tokenizer=CharTokenizer())
 
 
 # ---------------------------------------------------------------------------
@@ -374,15 +492,17 @@ def test_a_generation_that_parses_to_no_turns_still_keeps_its_tokens() -> None:
     has to show that the policy ignored the format, not that it reasoned and gave
     up, because section 15 has those dumps read by eye.
     """
-    policy = ScriptedPolicy("Ada Lovelace, I think.", token_ids_per_turn=4)
+    policy = ScriptedTokenPolicy("Ada Lovelace, I think.")
 
-    traj = run_episode(QUESTION, policy, FakeRetriever(), config(), tokenizer=CountingTokenizer())
+    traj = run_token_episode(
+        QUESTION, policy, FakeRetriever(), config(), tokenizer=CharTokenizer()
+    ).trajectory
 
     assert traj.termination is Termination.PARSE_ERROR
     assert traj.parse_failure is ParseFailure.NO_ANSWER
     assert [t.kind for t in traj.turns] == [TurnKind.UNPARSED]
     assert traj.turns[0].text == "Ada Lovelace, I think."
-    assert traj.turns[0].token_ids == (100, 101, 102, 103)
+    assert traj.turns[0].token_ids == tuple(ord(c) for c in "Ada Lovelace, I think.")
     assert traj.turns[0].generated is True
 
 
@@ -393,3 +513,13 @@ def test_a_generation_with_no_text_and_no_tokens_adds_no_turn() -> None:
 
     assert traj.turns == ()
     assert traj.termination is Termination.PARSE_ERROR
+
+
+def test_a_served_question_may_have_no_gold_answers() -> None:
+    """The policy server's case (#38): the loop never reads them."""
+    served = Question(question_id="s1", question="Who wrote the notes?")
+
+    traj = run_episode(served, ScriptedPolicy("<answer>Ada</answer>"), FakeRetriever(), config())
+
+    assert traj.gold_answers == ()
+    assert traj.termination is Termination.ANSWERED

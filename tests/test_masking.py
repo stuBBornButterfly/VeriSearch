@@ -19,7 +19,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from verisearch.env.episode import EpisodeConfig, Generation, Question, run_episode
+from verisearch.env.episode import EpisodeConfig, Generation, Question, run_token_episode
 from verisearch.testing import DEFAULT_CORPUS, FakeRetriever, make_trajectory
 from verisearch.train.masking import (
     INJECTED_TOKEN,
@@ -162,7 +162,12 @@ def test_a_think_turn_without_ids_is_not_partial_tokenization() -> None:
 
 
 class TwoHopPolicy:
-    """Searches twice, then answers. Returns ids, like vLLM will."""
+    """Searches twice, then answers. A token policy, as training's is.
+
+    Its ids live in their own range (1000 + the character), which
+    `PolicyRangeTokenizer` decodes, so the end-to-end test below can tell a
+    policy token from an injected one by value as well as by position.
+    """
 
     def __init__(self) -> None:
         self._script = [
@@ -170,25 +175,29 @@ class TwoHopPolicy:
             "<think>Now the author.</think><search>Ada Lovelace notes</search>",
             "<answer>Ada Lovelace</answer>",
         ]
-        self._turn = 0
 
-    def generate(self, prompt: str, *, stop: Sequence[str], max_new_tokens: int) -> Generation:
-        assert prompt
+    def generate_ids(
+        self, context_ids: Sequence[int], *, stop: Sequence[str], max_new_tokens: int
+    ) -> Generation:
+        assert context_ids
         assert stop
         assert max_new_tokens > 0
-        text = self._script[self._turn]
-        base = 1000 * (self._turn + 1)
-        self._turn += 1
-        return Generation(text=text, token_ids=tuple(range(base, base + 6)))
+        text = self._script.pop(0)
+        return Generation(text=text, token_ids=tuple(1000 + ord(char) for char in text))
 
 
-class WordLengthTokenizer:
+class PolicyRangeTokenizer:
+    """Encodes injected text below 1000 and decodes both ranges."""
+
     def encode(self, text: str) -> list[int]:
-        return [len(word) for word in text.split()]
+        return [ord(char) for char in text]
+
+    def decode(self, token_ids: Sequence[int]) -> str:
+        return "".join(chr(token - 1000 if token >= 1000 else token) for token in token_ids)
 
 
 def _real_trajectory() -> Trajectory:
-    return run_episode(
+    return run_token_episode(
         Question(
             question_id="q1",
             question="Who wrote the first notes on the Analytical Engine?",
@@ -197,8 +206,8 @@ def _real_trajectory() -> Trajectory:
         TwoHopPolicy(),
         FakeRetriever(),
         EpisodeConfig(search_budget=2, max_turns=4, max_new_tokens=64, top_k=2),
-        tokenizer=WordLengthTokenizer(),
-    )
+        tokenizer=PolicyRangeTokenizer(),
+    ).trajectory
 
 
 def test_a_real_two_hop_trajectory_masks_only_the_injected_passages() -> None:
