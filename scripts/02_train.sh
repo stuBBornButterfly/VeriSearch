@@ -21,6 +21,15 @@
 #   LAMBDA=0.02 OUT=checkpoints/lambda-0.02 bash scripts/02_train.sh
 #   bash scripts/02_train.sh --plan
 #
+# QUESTIONS takes one or more files, space-separated. PER_FILE=N draws N from
+# each, seeded by the config's seed, so a HotpotQA + 2WikiMultihopQA mix stays
+# 50/50 whatever the files' sizes (PROJECT.md section 7):
+#   QUESTIONS="data/processed/hotpotqa_train.jsonl data/processed/2wikimultihopqa_train.jsonl" \
+#     PER_FILE=1000 bash scripts/02_train.sh
+#
+# Every run writes OUT/resolved_config.json before training and OUT/adapter/
+# after, which is what eval and `vllm serve --lora-modules` read.
+#
 # Needs the [train] extra and a GPU for anything but --plan:
 #   uv sync --extra dev --extra train
 set -euo pipefail
@@ -29,6 +38,7 @@ CONFIGS="${CONFIGS:-configs/base.yaml configs/dev_1.5b.yaml}"
 QUESTIONS="${QUESTIONS:-data/processed/hotpotqa_train.jsonl}"
 OUT="${OUT:-checkpoints/grpo}"
 LIMIT="${LIMIT:-}"
+PER_FILE="${PER_FILE:-}"
 LAMBDA="${LAMBDA:-}"
 
 # --steps, --smoke and --plan are forwarded; anything else is rejected here
@@ -110,6 +120,13 @@ EXTRA=()
 if [[ -n "${LIMIT}" ]]; then
   EXTRA+=(--limit "${LIMIT}")
 fi
+if [[ -n "${PER_FILE}" ]]; then
+  EXTRA+=(--per-file "${PER_FILE}")
+fi
+QUESTION_ARGS=()
+for path in ${QUESTIONS}; do
+  QUESTION_ARGS+=("${path}")
+done
 if [[ -n "${LAMBDA}" ]]; then
   EXTRA+=(--lambda-cost "${LAMBDA}")
 fi
@@ -119,7 +136,7 @@ echo "           out:     ${OUT}"
 
 "${PYTHON}" -m verisearch.train.grpo \
   "${CONFIG_ARGS[@]}" \
-  --questions "${QUESTIONS}" \
+  --questions "${QUESTION_ARGS[@]}" \
   --out "${OUT}" \
   ${STEPS[@]+"${STEPS[@]}"} \
   ${SMOKE[@]+"${SMOKE[@]}"} \
